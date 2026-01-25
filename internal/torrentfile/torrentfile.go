@@ -10,12 +10,13 @@ import (
 
 // TorrentFile represents the parsed .torrent file
 type TorrentFile struct {
-	Announce    string
-	InfoHash    [20]byte
-	PieceHashes [][20]byte
-	PieceLength int
-	Length      int
-	Name        string
+	Announce     string
+	AnnounceList [][]string // Tiers of backup trackers
+	InfoHash     [20]byte
+	PieceHashes  [][20]byte
+	PieceLength  int
+	Length       int
+	Name         string
 }
 
 // Open parses a .torrent file and returns a TorrentFile
@@ -40,7 +41,14 @@ func Open(path string) (*TorrentFile, error) {
 	// Extract announce URL
 	announce, err := bencode.GetString(root, "announce")
 	if err != nil {
-		return nil, fmt.Errorf("failed to get announce: %w", err)
+		// Some torrents only have announce-list, no single announce
+		announce = ""
+	}
+
+	// Extract announce-list (optional, array of arrays of strings)
+	var announceList [][]string
+	if announceListVal, ok := root["announce-list"]; ok {
+		announceList = parseAnnounceList(announceListVal)
 	}
 
 	// Extract info dictionary
@@ -103,15 +111,48 @@ func Open(path string) (*TorrentFile, error) {
 	}
 
 	tf := &TorrentFile{
-		Announce:    announce,
-		InfoHash:    infoHash,
-		PieceHashes: pieceHashes,
-		PieceLength: int(pieceLength),
-		Length:      int(length),
-		Name:        name,
+		Announce:     announce,
+		AnnounceList: announceList,
+		InfoHash:     infoHash,
+		PieceHashes:  pieceHashes,
+		PieceLength:  int(pieceLength),
+		Length:       int(length),
+		Name:         name,
 	}
 
 	return tf, nil
+}
+
+// parseAnnounceList converts bencode value to [][]string
+func parseAnnounceList(val bencode.Value) [][]string {
+	var result [][]string
+
+	// announce-list is a list of lists
+	outerList, ok := val.([]bencode.Value)
+	if !ok {
+		return result
+	}
+
+	for _, tierVal := range outerList {
+		tier, ok := tierVal.([]bencode.Value)
+		if !ok {
+			continue
+		}
+
+		var trackers []string
+		for _, trackerVal := range tier {
+			tracker, ok := trackerVal.(string)
+			if ok {
+				trackers = append(trackers, tracker)
+			}
+		}
+
+		if len(trackers) > 0 {
+			result = append(result, trackers)
+		}
+	}
+
+	return result
 }
 
 // calculateInfoHash computes the SHA-1 hash of the info dictionary
