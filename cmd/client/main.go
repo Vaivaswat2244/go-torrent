@@ -77,19 +77,23 @@ func main() {
 		log.Println("1. Try a different torrent with working trackers")
 		log.Println("2. Hardcode a known peer IP for testing Phase 2")
 		log.Println("3. Continue to Phase 2 with mock data")
+	} else if len(peers) == 0 {
+		fmt.Println("⚠️  Tracker responded but returned no peers")
+		fmt.Println("This means:")
+		fmt.Println("  - You might be the only downloader")
+		fmt.Println("  - Or all returned peers were filtered (yourself)")
+		fmt.Println("  - Try a more popular torrent")
 	} else {
-		fmt.Printf("✅ Found %d peers!\n", len(peers))
+		fmt.Printf("✅ Found %d peer(s)!\n", len(peers))
 		fmt.Println("\nFirst 10 peers:")
 		for i, peer := range peers {
-			if i >= 10 {
+			if i >= len(peers) {
 				break
 			}
 			fmt.Printf("  %d. %s\n", i+1, peer.String())
+			i++
 		}
 	}
 
-	// Phase 1: Just print info
-	// Later phases: Start downloading
-	fmt.Printf("\nOutput directory: %s\n", *outputDir)
-	fmt.Println("Ready to download! (Download logic will be added in Phase 2)")
+	fmt.Printf("\nDownload directory: %s\n", *outputDir)
 }
