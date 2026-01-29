@@ -99,7 +99,7 @@ func Open(path string) (*TorrentFile, error) {
 	}
 
 	// Calculate info hash
-	infoHash, err := calculateInfoHash(data)
+	infoHash, err := calculateInfoHash(infoDict)
 	if err != nil {
 		return nil, fmt.Errorf("failed to calculate info hash: %w", err)
 	}
@@ -156,74 +156,97 @@ func parseAnnounceList(val bencode.Value) [][]string {
 }
 
 // calculateInfoHash computes the SHA-1 hash of the info dictionary
-func calculateInfoHash(data []byte) ([20]byte, error) {
-	// Find the info dictionary in the bencoded data
-	// The info dict starts after "4:info" and ends at the matching 'e'
-
-	infoStart := findInfoDictStart(data)
-	if infoStart == -1 {
-		return [20]byte{}, fmt.Errorf("info dictionary not found")
+func calculateInfoHash(infoDict map[string]bencode.Value) ([20]byte, error) {
+	// Re-encode the info dictionary to bencode
+	// This ensures we get the exact bytes that were in the original torrent
+	encoded, err := encodeDict(infoDict)
+	if err != nil {
+		return [20]byte{}, fmt.Errorf("failed to encode info dict: %w", err)
 	}
 
-	infoEnd := findInfoDictEnd(data, infoStart)
-	if infoEnd == -1 {
-		return [20]byte{}, fmt.Errorf("info dictionary end not found")
-	}
-
-	infoData := data[infoStart:infoEnd]
-	return sha1.Sum(infoData), nil
+	// Calculate SHA-1 hash
+	return sha1.Sum(encoded), nil
 }
 
-// findInfoDictStart finds the start position of the info dictionary
-func findInfoDictStart(data []byte) int {
-	// Look for "4:infod"
-	needle := []byte("4:info")
-	for i := 0; i < len(data)-len(needle); i++ {
-		if string(data[i:i+len(needle)]) == string(needle) {
-			return i + len(needle)
+// encodeDict encodes a bencode dictionary back to bytes
+func encodeDict(dict map[string]bencode.Value) ([]byte, error) {
+	var buf []byte
+	buf = append(buf, 'd') // Start dictionary
+
+	// Bencode requires keys to be sorted
+	keys := make([]string, 0, len(dict))
+	for k := range dict {
+		keys = append(keys, k)
+	}
+
+	// Sort keys alphabetically (bencode requirement)
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[i] > keys[j] {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
 		}
 	}
-	return -1
+
+	// Encode each key-value pair
+	for _, key := range keys {
+		// Encode key (string)
+		keyBytes := encodeString(key)
+		buf = append(buf, keyBytes...)
+
+		// Encode value
+		valBytes, err := encodeValue(dict[key])
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, valBytes...)
+	}
+
+	buf = append(buf, 'e') // End dictionary
+	return buf, nil
 }
 
-// findInfoDictEnd finds the end of a dictionary starting at pos
-func findInfoDictEnd(data []byte, start int) int {
-	depth := 1
-	pos := start
+// encodeValue encodes any bencode value
+func encodeValue(val bencode.Value) ([]byte, error) {
+	switch v := val.(type) {
+	case string:
+		return encodeString(v), nil
+	case int64:
+		return encodeInt(v), nil
+	case []bencode.Value:
+		return encodeList(v)
+	case map[string]bencode.Value:
+		return encodeDict(v)
+	default:
+		return nil, fmt.Errorf("unsupported type: %T", v)
+	}
+}
 
-	for pos < len(data) && depth > 0 {
-		switch data[pos] {
-		case 'd', 'l':
-			depth++
-		case 'e':
-			depth--
-			if depth == 0 {
-				return pos + 1
-			}
-		case 'i':
-			// Skip integer
-			pos++
-			for pos < len(data) && data[pos] != 'e' {
-				pos++
-			}
-		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
-			// Skip string
-			colonPos := pos
-			for colonPos < len(data) && data[colonPos] != ':' {
-				colonPos++
-			}
-			if colonPos >= len(data) {
-				return -1
-			}
-			lengthStr := string(data[pos:colonPos])
-			length := 0
-			fmt.Sscanf(lengthStr, "%d", &length)
-			pos = colonPos + 1 + length - 1
+// encodeString encodes a string to bencode format
+func encodeString(s string) []byte {
+	return []byte(fmt.Sprintf("%d:%s", len(s), s))
+}
+
+// encodeInt encodes an integer to bencode format
+func encodeInt(i int64) []byte {
+	return []byte(fmt.Sprintf("i%de", i))
+}
+
+// encodeList encodes a list to bencode format
+func encodeList(list []bencode.Value) ([]byte, error) {
+	var buf []byte
+	buf = append(buf, 'l') // Start list
+
+	for _, item := range list {
+		itemBytes, err := encodeValue(item)
+		if err != nil {
+			return nil, err
 		}
-		pos++
+		buf = append(buf, itemBytes...)
 	}
 
-	return -1
+	buf = append(buf, 'e') // End list
+	return buf, nil
 }
 
 // splitPieceHashes splits the pieces string into 20-byte hashes

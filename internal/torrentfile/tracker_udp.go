@@ -195,10 +195,13 @@ func udpAnnounce(conn *net.UDPConn, connectionID uint64, infoHash [20]byte, peer
 
 	// Parse peer list (6 bytes per peer)
 	peersData := resp[20:n]
-	peers, err := parsePeers(peersData)
+	allPeers, err := parsePeers(peersData)
 	if err != nil {
 		return nil, err
 	}
+
+	// Filter out our own IP/port
+	peers := filterSelfPeer(allPeers, port)
 
 	return peers, nil
 }
