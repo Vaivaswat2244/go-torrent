@@ -4,8 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"time"
 
+	"github.com/Vaivaswat2244/go-torrent/internal/p2p"
+	peersPkg "github.com/Vaivaswat2244/go-torrent/internal/peers"
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
 
@@ -68,7 +72,11 @@ func main() {
 	}
 	fmt.Printf("Will try %d tracker(s)...\n", trackerCount)
 
-	peers, err := tf.RequestPeers(peerID, 6881)
+	// Use a random port to avoid getting our own IP back
+	// (In production, you'd use your actual listening port)
+	port := uint16(6881)
+
+	peers, err := tf.RequestPeers(peerID, port)
 	if err != nil {
 		log.Printf("⚠️  All trackers failed: %v\n", err)
 		log.Println("This is normal for old torrents - trackers die frequently")
@@ -87,13 +95,132 @@ func main() {
 		fmt.Printf("✅ Found %d peer(s)!\n", len(peers))
 		fmt.Println("\nFirst 10 peers:")
 		for i, peer := range peers {
-			if i >= len(peers) {
+			if i >= 10 {
 				break
 			}
 			fmt.Printf("  %d. %s\n", i+1, peer.String())
-			i++
+		}
+
+		// Phase 2: Try downloading from multiple peers
+		fmt.Println("\n=== Phase 2: Attempting to download piece 0 ===")
+		success := false
+		maxAttempts := 10 // Try up to 10 peers
+		if len(peers) < maxAttempts {
+			maxAttempts = len(peers)
+		}
+
+		for i := 0; i < maxAttempts && !success; i++ {
+			fmt.Printf("\n[%d/%d] Trying peer %s...\n", i+1, maxAttempts, peers[i].String())
+			err = testDownloadPiece(tf, peers[i], peerID)
+			if err != nil {
+				log.Printf("  ❌ Failed: %v\n", err)
+			} else {
+				success = true
+				fmt.Println("\n🎉 SUCCESS! Downloaded and verified piece 0!")
+			}
+		}
+
+		if !success {
+			log.Println("\n⚠️  Could not connect to any peers")
+			log.Println("Common reasons:")
+			log.Println("  - Peers behind firewalls/NAT")
+			log.Println("  - Peers went offline")
+			log.Println("  - Network connectivity issues")
+			log.Println("Try running again - you'll get different peers from tracker")
 		}
 	}
 
-	fmt.Printf("\nDownload directory: %s\n", *outputDir)
+	// Phase 1: Just print info
+	// Later phases: Start downloading
+	fmt.Printf("\nOutput directory: %s\n", *outputDir)
+	fmt.Println("Ready for Phase 3: Multi-peer download!")
+}
+
+func testDownloadPiece(tf *torrentfile.TorrentFile, peer torrentfile.Peer, peerID [20]byte) error {
+	// Connect to peer with short timeout
+	conn, err := net.DialTimeout("tcp", peer.String(), 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer conn.Close()
+	fmt.Println("  ✅ Connected!")
+
+	// Complete handshake
+	fmt.Println("  Handshaking...")
+	client, err := peersPkg.CompleteHandshake(conn, tf.InfoHash, peerID)
+	if err != nil {
+		return fmt.Errorf("handshake failed: %w", err)
+	}
+	fmt.Println("  ✅ Handshake complete!")
+
+	// Read bitfield
+	fmt.Println("  Reading bitfield...")
+	msg, err := client.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("failed to read bitfield: %w", err)
+	}
+
+	if msg == nil || msg.ID != peersPkg.MsgBitfield {
+		return fmt.Errorf("expected bitfield, got %v", msg)
+	}
+	client.Bitfield = msg.Payload
+	fmt.Printf("  ✅ Bitfield received (%d bytes)\n", len(client.Bitfield))
+
+	// Check if peer has piece 0
+	bf := p2p.Bitfield(client.Bitfield)
+	if !bf.HasPiece(0) {
+		return fmt.Errorf("peer doesn't have piece 0")
+	}
+	fmt.Println("  ✅ Peer has piece 0!")
+
+	// Send interested
+	fmt.Println("  Sending interested...")
+	err = client.SendInterested()
+	if err != nil {
+		return fmt.Errorf("failed to send interested: %w", err)
+	}
+
+	// Wait for unchoke
+	fmt.Println("  Waiting for unchoke...")
+	unchokeTimeout := time.After(10 * time.Second)
+	for client.Choked {
+		select {
+		case <-unchokeTimeout:
+			return fmt.Errorf("timeout waiting for unchoke")
+		default:
+			client.Conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			msg, err := client.ReadMessage()
+			if err != nil {
+				return fmt.Errorf("failed to read message: %w", err)
+			}
+			if msg != nil && msg.ID == peersPkg.MsgUnchoke {
+				client.Choked = false
+				fmt.Println("  ✅ Unchoked!")
+			}
+		}
+	}
+
+	// Download piece 0
+	fmt.Println("  Downloading piece 0...")
+	work := &p2p.PieceWork{
+		Index:  0,
+		Hash:   tf.PieceHashes[0],
+		Length: tf.PieceLength,
+	}
+
+	buf, err := work.Download(client)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+	fmt.Printf("  ✅ Downloaded %d bytes!\n", len(buf))
+
+	// Verify integrity
+	fmt.Println("  Verifying SHA-1 hash...")
+	err = work.CheckIntegrity(buf)
+	if err != nil {
+		return fmt.Errorf("integrity check failed: %w", err)
+	}
+	fmt.Println("  ✅ Hash verified!")
+
+	return nil
 }
