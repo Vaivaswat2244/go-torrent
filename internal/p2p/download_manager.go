@@ -159,18 +159,26 @@ func DownloadPieceConcurrent(
 	// Wait for results
 	// Strategy: Return first success, or all failures
 	var lastErr error
+	successCount := 0
 	for i := 0; i < len(peers); i++ {
 		result := <-resultChan
 
 		if result.Err == nil {
-			// Success! Return the data
-			fmt.Printf("\n🎉 SUCCESS! Peer %d/%d completed the download!\n",
-				result.PeerNum, len(peers))
-			return result.Data, nil
-		}
+			successCount++
+			if successCount == 1 {
+				// First success! Return the data
+				fmt.Printf("\n🎉 SUCCESS! Peer %d/%d completed the download!\n",
+					result.PeerNum, len(peers))
+				fmt.Println("✅ Piece 0 downloaded and verified!")
 
-		// Track last error for reporting
-		lastErr = result.Err
+				// Return immediately with the data
+				// Other goroutines will continue but we ignore their results
+				return result.Data, nil
+			}
+		} else {
+			// Track last error for reporting
+			lastErr = result.Err
+		}
 	}
 
 	// All peers failed
