@@ -124,6 +124,57 @@ func TryDownloadFromPeer(attempt PeerAttempt) PeerResult {
 	return result
 }
 
+func Worker(peer torrentfile.Peer, tf *torrentfile.TorrentFile, peerID [20]byte, workQueue chan *PieceWork, results chan *PieceResult) {
+	// 1. Connect and Handshake (Done ONCE per worker)
+	conn, err := net.DialTimeout("tcp", peer.String(), 3*time.Second)
+	if err != nil {
+		return
+	} // Peer offline, worker dies silently
+	defer conn.Close()
+
+	client, err := peers.CompleteHandshake(conn, tf.InfoHash, peerID)
+	if err != nil {
+		return
+	}
+
+	msg, err := client.ReadMessage()
+	if err != nil || msg == nil || msg.ID != peers.MsgBitfield {
+		return
+	}
+	client.Bitfield = msg.Payload
+
+	// Tell them we want data
+	client.SendInterested()
+
+	// 2. Process jobs from the queue
+	for work := range workQueue {
+		// Does this peer even have the piece we need?
+		bf := Bitfield(client.Bitfield)
+		if !bf.HasPiece(work.Index) {
+			workQueue <- work                 // Put the job back for another worker
+			time.Sleep(50 * time.Millisecond) // Don't spinlock the CPU
+			continue
+		}
+
+		// Try to download
+		buf, err := work.Download(client)
+		if err == nil {
+			err = work.CheckIntegrity(buf)
+			if err == nil {
+				// Success! Send to results
+				results <- &PieceResult{Index: work.Index, Buf: buf}
+				continue
+			}
+		}
+
+		// If we reach here, the download or hash check failed.
+		// Put the piece back in the queue and kill this worker
+		// (the connection is likely broken or the peer sent bad data).
+		workQueue <- work
+		return
+	}
+}
+
 // DownloadPieceConcurrent tries to download a piece from multiple peers concurrently
 // Returns the first successful download
 func DownloadPieceConcurrent(

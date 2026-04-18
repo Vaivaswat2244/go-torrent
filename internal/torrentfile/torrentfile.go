@@ -8,6 +8,11 @@ import (
 	"github.com/Vaivaswat2244/go-torrent/internal/bencode"
 )
 
+type FileInfo struct {
+	Length int
+	Path   []string // List of folder names and the file name
+}
+
 // TorrentFile represents the parsed .torrent file
 type TorrentFile struct {
 	Announce     string
@@ -17,6 +22,7 @@ type TorrentFile struct {
 	PieceLength  int
 	Length       int
 	Name         string
+	Files        []FileInfo
 }
 
 // Open parses a .torrent file and returns a TorrentFile
@@ -75,26 +81,57 @@ func Open(path string) (*TorrentFile, error) {
 
 	// Get length (single file) or calculate from files (multi-file)
 	length := int64(0)
+	var files []FileInfo
+
 	lengthVal, err := bencode.GetInt(infoDict, "length")
 	if err == nil {
 		// Single file torrent
 		length = lengthVal
+		files = append(files, FileInfo{
+			Length: int(length),
+			Path:   []string{name},
+		})
 	} else {
 		// Multi-file torrent
 		filesVal, ok := infoDict["files"]
-		if ok {
-			filesList, ok := filesVal.([]bencode.Value)
-			if ok {
-				for _, f := range filesList {
-					fileDict, ok := f.(map[string]bencode.Value)
-					if ok {
-						fileLen, err := bencode.GetInt(fileDict, "length")
-						if err == nil {
-							length += fileLen
-						}
-					}
+		if !ok {
+			return nil, fmt.Errorf("missing both length and files")
+		}
+
+		filesList, ok := filesVal.([]bencode.Value)
+		if !ok {
+			return nil, fmt.Errorf("files is not a list")
+		}
+		for _, f := range filesList {
+			fileDict, ok := f.(map[string]bencode.Value)
+			if !ok {
+				continue
+			}
+
+			fileLen, err := bencode.GetInt(fileDict, "length")
+			if err != nil {
+				continue
+			}
+
+			length += fileLen
+
+			// Extract the path list (e.g. ["subtitles", "de.srt"])
+			pathVal, ok := fileDict["path"].([]bencode.Value)
+			if !ok {
+				continue
+			}
+
+			var path []string
+			for _, p := range pathVal {
+				if str, ok := p.(string); ok {
+					path = append(path, str)
 				}
 			}
+
+			files = append(files, FileInfo{
+				Length: int(fileLen),
+				Path:   path,
+			})
 		}
 	}
 
@@ -118,6 +155,7 @@ func Open(path string) (*TorrentFile, error) {
 		PieceLength:  int(pieceLength),
 		Length:       int(length),
 		Name:         name,
+		Files:        files,
 	}
 
 	return tf, nil

@@ -102,64 +102,70 @@ func main() {
 		}
 
 		// Phase 2: Try downloading from multiple peers concurrently
-		fmt.Println("\n=== Phase 2: Attempting to download piece 0 ===")
-		fmt.Printf("Trying %d peers concurrently...\n", len(peers))
-
-		// Channel to receive successful download
-		resultChan := make(chan error, len(peers))
-		successChan := make(chan int, 1) // Channel to signal which peer succeeded
-
-		// Launch goroutine for each peer
-		for i, peer := range peers {
-			go func(index int, p torrentfile.Peer) {
-				err := testDownloadPiece(tf, p, peerID, index+1, len(peers))
-				if err == nil {
-					// Signal success with peer index
-					select {
-					case successChan <- index + 1:
-						resultChan <- nil
-					default:
-						// Another peer already succeeded
-					}
-				} else {
-					resultChan <- err
-				}
-			}(i, peer)
+		fmt.Println("\n=== Phase 3: Full File Download ===")
+		writer, err := p2p.NewMultiFileWriter(*outputDir, tf)
+		if err != nil {
+			log.Fatalf("Failed to create output files: %v", err)
 		}
+		defer writer.Close()
 
-		// Wait for first success or all failures
-		success := false
-		failCount := 0
+		// 2. Create Channels
+		numPieces := len(tf.PieceHashes)
+		workQueue := make(chan *p2p.PieceWork, numPieces)
+		results := make(chan *p2p.PieceResult)
 
-		for i := 0; i < len(peers); i++ {
-			select {
-			case peerNum := <-successChan:
-				if !success {
-					success = true
-					fmt.Printf("\n🎉 SUCCESS! Peer %d/%d completed the download!\n", peerNum, len(peers))
-					fmt.Println("✅ Piece 0 downloaded and verified!")
-					// Don't break - let other goroutines finish
-				}
-			case err := <-resultChan:
-				if err != nil {
-					failCount++
+		// 3. Populate the Work Queue with all pieces
+		for i, hash := range tf.PieceHashes {
+			length := tf.PieceLength
+
+			// Handle the "Last Piece" gotcha!
+			if i == numPieces-1 {
+				remainder := tf.Length % tf.PieceLength
+				if remainder != 0 {
+					length = remainder
 				}
 			}
 
-			if success && failCount+1 >= len(peers) {
-				// Got success and all other peers finished
-				break
+			workQueue <- &p2p.PieceWork{
+				Index:  i,
+				Hash:   hash,
+				Length: length,
 			}
 		}
 
-		if !success {
-			log.Println("\n⚠️  Could not connect to any peers")
-			log.Println("Common reasons:")
-			log.Println("  - Peers behind firewalls/NAT")
-			log.Println("  - Peers went offline")
-			log.Println("  - Network connectivity issues")
-			log.Println("Try running again - you'll get different peers from tracker")
+		// 4. Launch a Worker for every peer
+		fmt.Printf("Launching %d workers...\n", len(peers))
+		for _, peer := range peers {
+			go p2p.Worker(peer, tf, peerID, workQueue, results)
 		}
+
+		// 5. Collect results and write to disk
+		piecesDone := 0
+		startTime := time.Now()
+
+		for piecesDone < numPieces {
+			// Wait for a worker to finish a piece
+			res := <-results
+
+			// Write it to the file
+			err := writer.WritePiece(res.Index, res.Buf)
+			if err != nil {
+				log.Fatalf("Critical error writing to disk: %v", err)
+			}
+
+			piecesDone++
+
+			// Print progress
+			percent := float64(piecesDone) / float64(numPieces) * 100
+			speed := float64(piecesDone*tf.PieceLength) / time.Since(startTime).Seconds() / 1024 / 1024 // MB/s
+
+			fmt.Printf("\rProgress: [%d/%d] %.2f%% | Speed: %.2f MB/s",
+				piecesDone, numPieces, percent, speed)
+		}
+
+		// 6. Cleanup
+		close(workQueue) // This tells all workers to shut down
+		fmt.Printf("\n\n🎉 DOWNLOAD COMPLETE: %s\n", tf.Name)
 	}
 
 	// Phase 1: Just print info
