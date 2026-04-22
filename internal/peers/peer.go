@@ -50,6 +50,13 @@ func CompleteHandshake(conn net.Conn, infoHash, peerID [20]byte) (*Client, error
 	}, nil
 }
 
+func (c *Client) SendBitfield(bf []byte) error {
+	return c.SendMessage(&Message{
+		ID:      MsgBitfield,
+		Payload: bf,
+	})
+}
+
 // SendMessage sends a message to the peer
 func (c *Client) SendMessage(msg *Message) error {
 	_, err := c.Conn.Write(msg.Serialize())

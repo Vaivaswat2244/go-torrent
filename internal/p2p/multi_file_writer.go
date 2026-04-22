@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -131,6 +132,58 @@ func (mw *MultiFileWriter) WritePiece(pieceIndex int, data []byte) error {
 	}
 
 	return nil
+}
+
+func (mw *MultiFileWriter) ReadPiece(pieceIndex int, expectedLength int) ([]byte, error) {
+	data := make([]byte, expectedLength)
+	pieceStart := int64(pieceIndex) * int64(mw.pieceLength)
+	pieceEnd := pieceStart + int64(expectedLength)
+
+	dataOffset := 0
+
+	for _, f := range mw.files {
+		fileStart := f.globalOffset
+		fileEnd := f.globalOffset + f.length
+
+		// Skip files that don't overlap with this piece
+		if fileEnd <= pieceStart {
+			continue
+		}
+		if fileStart >= pieceEnd {
+			break
+		}
+
+		localSeekPos := int64(0)
+		if pieceStart > fileStart {
+			localSeekPos = pieceStart - fileStart
+		}
+
+		bytesToRead := int64(expectedLength - dataOffset)
+		if localSeekPos+bytesToRead > f.length {
+			bytesToRead = f.length - localSeekPos
+		}
+
+		_, err := f.file.Seek(localSeekPos, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		// Use io.ReadFull to guarantee we read exactly what we need
+		chunkToRead := data[dataOffset : dataOffset+int(bytesToRead)]
+		_, err = io.ReadFull(f.file, chunkToRead)
+		if err != nil {
+			return nil, err
+		} // File might not be fully written yet, that's fine
+
+		dataOffset += int(bytesToRead)
+		pieceStart += bytesToRead
+
+		if dataOffset >= expectedLength {
+			break
+		}
+	}
+
+	return data, nil
 }
 
 func (mw *MultiFileWriter) Close() {

@@ -124,7 +124,7 @@ func TryDownloadFromPeer(attempt PeerAttempt) PeerResult {
 	return result
 }
 
-func Worker(peer torrentfile.Peer, tf *torrentfile.TorrentFile, peerID [20]byte, workQueue chan *PieceWork, results chan *PieceResult) {
+func Worker(peer torrentfile.Peer, tf *torrentfile.TorrentFile, peerID [20]byte, ourBitfield Bitfield, workQueue chan *PieceWork, results chan *PieceResult) {
 	// 1. Connect and Handshake (Done ONCE per worker)
 	conn, err := net.DialTimeout("tcp", peer.String(), 3*time.Second)
 	if err != nil {
@@ -133,6 +133,11 @@ func Worker(peer torrentfile.Peer, tf *torrentfile.TorrentFile, peerID [20]byte,
 	defer conn.Close()
 
 	client, err := peers.CompleteHandshake(conn, tf.InfoHash, peerID)
+	if err != nil {
+		return
+	}
+
+	err = client.SendBitfield(ourBitfield)
 	if err != nil {
 		return
 	}
