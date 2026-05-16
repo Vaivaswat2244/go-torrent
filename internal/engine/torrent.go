@@ -45,6 +45,9 @@ type Torrent struct {
 	bytesSinceLast time.Time
 	activePeers    int
 
+	sessionPieces int       // Pieces downloaded *this* time
+	startTime     time.Time // When we started
+
 	// Channels
 	stopChan chan struct{}
 }
@@ -106,13 +109,21 @@ func (t *Torrent) GetStats() TorrentStats {
 		progress = float64(t.piecesDone) / float64(t.totalPieces) * 100
 	}
 
+	speed := 0.0
+	if t.sessionPieces > 0 {
+		elapsed := time.Since(t.startTime).Seconds()
+		if elapsed > 0 {
+			bytesDownloaded := float64(t.sessionPieces * t.TF.PieceLength)
+			speed = bytesDownloaded / elapsed / 1024 / 1024 // Convert to MB/s
+		}
+	}
+
 	return TorrentStats{
 		Name:        t.TF.Name,
 		Progress:    progress,
 		Status:      t.status,
 		PeersActive: t.activePeers,
-		// (We'll calculate instantaneous speed later, setting to 0 for now)
-		SpeedMBps: 0.0,
+		SpeedMBps:   speed,
 	}
 }
 
@@ -120,6 +131,7 @@ func (t *Torrent) GetStats() TorrentStats {
 func (t *Torrent) Start(peerID [20]byte, port uint16) {
 	t.mu.Lock()
 	t.status = StatusStarting
+	t.startTime = time.Now()
 	t.mu.Unlock()
 
 	t.VerifyExistingState()
@@ -182,6 +194,7 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 				if err == nil {
 					t.mu.Lock()
 					t.piecesDone++
+					t.sessionPieces++
 					t.mu.Unlock()
 				}
 			}
