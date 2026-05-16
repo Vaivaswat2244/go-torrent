@@ -48,14 +48,6 @@ Download to a specific output directory:
 ### Stopping & Resuming
 You can safely stop the daemon at any time using `Ctrl+C`. When you restart the command, `go-torrent` will scan your output directory, verify the SHA-1 hashes of the existing pieces, and resume downloading only the missing data.
 
-## 🗺️ Roadmap / Future Enhancements
-
-While the client is a highly capable downloader, there are several exciting protocol enhancements planned for the future:
-
-- [ ] **Seeding (Upload Engine):** Opening a TCP listener to serve pieces back to the swarm (Tit-for-Tat compliance).
-- [ ] **DHT (Distributed Hash Table):** Implementing BEP-5 for trackerless peer discovery.
-- [ ] **Magnet Links:** Supporting metadata extension (BEP-9) to download torrents without `.torrent` files.
-- [ ] **Rich Frontend:** Replacing the standard CLI output with a Web UI (WebSockets/React) or a Rich Terminal UI (Bubbletea).
 
 ## 📄 License
 
