@@ -9,7 +9,7 @@ import (
 )
 
 const MaxBlockSize = 16384 // 16 KB - standard block size
-const MaxBacklog = 5       // Max pipelined requests
+const MaxBacklog = 50      // Max pipelined requests
 
 // PieceWork represents a work item: download this piece
 type PieceWork struct {

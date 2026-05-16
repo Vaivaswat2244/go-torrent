@@ -156,8 +156,8 @@ func Worker(peer torrentfile.Peer, tf *torrentfile.TorrentFile, peerID [20]byte,
 		// Does this peer even have the piece we need?
 		bf := Bitfield(client.Bitfield)
 		if !bf.HasPiece(work.Index) {
-			workQueue <- work                 // Put the job back for another worker
-			time.Sleep(50 * time.Millisecond) // Don't spinlock the CPU
+			workQueue <- work                // Put the job back for another worker
+			time.Sleep(1 * time.Millisecond) // Don't spinlock the CPU
 			continue
 		}
 
