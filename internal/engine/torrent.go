@@ -4,9 +4,11 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"math"
+	"math/rand"
 	"sync"
 	"time"
 
+	"github.com/Vaivaswat2244/go-torrent/internal/dht"
 	"github.com/Vaivaswat2244/go-torrent/internal/p2p"
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
@@ -128,42 +130,44 @@ func (t *Torrent) GetStats() TorrentStats {
 }
 
 // Start begins the download in the background
+// Start begins the download in the background
 func (t *Torrent) Start(peerID [20]byte, port uint16) {
 	t.mu.Lock()
 	t.status = StatusStarting
 	t.startTime = time.Now()
 	t.mu.Unlock()
 
+	// 1. Verify what we already have on disk
 	t.VerifyExistingState()
 
-	// Launch in a background goroutine so it doesn't block the UI
+	// Launch the main orchestrator in a background goroutine
 	go func() {
 		defer t.Writer.Close()
 
-		// 1. Get Peers (Phase 1)
-		peers, err := t.TF.RequestPeers(peerID, port)
-		if err != nil {
-			t.mu.Lock()
-			t.status = StatusError
-			t.mu.Unlock()
-			return
-		}
-
 		t.mu.Lock()
 		t.status = StatusDownloading
-		t.activePeers = len(peers)
 		t.mu.Unlock()
 
-		// 2. Setup Work Queue (Phase 3)
+		// 2. Setup Channels
+		peerChan := make(chan torrentfile.Peer, 100) // Buffer for incoming peers
 		workQueue := make(chan *p2p.PieceWork, t.totalPieces)
 		results := make(chan *p2p.PieceResult)
 
-		for i, hash := range t.TF.PieceHashes {
-
-			if t.bitfield.HasPiece(i) {
-				continue
+		// 3. Populate Work Queue (Shuffled for Rarest-First emulation)
+		var missingPieces []int
+		for i := 0; i < t.totalPieces; i++ {
+			if !t.bitfield.HasPiece(i) {
+				missingPieces = append(missingPieces, i)
 			}
+		}
 
+		rand.Seed(time.Now().UnixNano())
+		rand.Shuffle(len(missingPieces), func(i, j int) {
+			missingPieces[i], missingPieces[j] = missingPieces[j], missingPieces[i]
+		})
+
+		for _, i := range missingPieces {
+			hash := t.TF.PieceHashes[i]
 			length := t.TF.PieceLength
 			if i == t.totalPieces-1 {
 				remainder := t.TF.Length % t.TF.PieceLength
@@ -174,16 +178,43 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 			workQueue <- &p2p.PieceWork{Index: i, Hash: hash, Length: length}
 		}
 
-		// 3. Launch Workers
-		for _, peer := range peers {
-			go p2p.Worker(peer, t.TF, peerID, t.bitfield, workQueue, results)
-		}
+		// 4. 🚀 LAUNCH THE TRACKER (Background)
+		go func() {
+			peers, err := t.TF.RequestPeers(peerID, port)
+			if err == nil {
+				for _, p := range peers {
+					peerChan <- p
+				}
+			}
+		}()
 
-		// 4. Collect Results safely
+		// 5. 🚀 LAUNCH THE DHT CRAWLER (Background)
+		go dht.FindPeers(t.TF.InfoHash, peerChan)
+
+		// 6. The Peer Manager (Listens for peers and launches workers dynamically)
+		go func() {
+			seenPeers := make(map[string]bool)
+			for peer := range peerChan {
+				addr := peer.String()
+
+				// Deduplicate: Only launch a worker if we haven't seen this IP yet
+				if !seenPeers[addr] {
+					seenPeers[addr] = true
+
+					t.mu.Lock()
+					t.activePeers++
+					t.mu.Unlock()
+
+					// Launch a new worker for this newly discovered peer!
+					go p2p.Worker(peer, t.TF, peerID, t.bitfield, workQueue, results)
+				}
+			}
+		}()
+
+		// 7. Collect Results
 		for t.piecesDone < t.totalPieces {
 			select {
 			case <-t.stopChan:
-				// UI asked us to stop
 				t.mu.Lock()
 				t.status = StatusStopped
 				t.mu.Unlock()
@@ -195,12 +226,15 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 					t.mu.Lock()
 					t.piecesDone++
 					t.sessionPieces++
+
+					// Update our bitfield so we know we have it
+					t.bitfield.SetPiece(res.Index)
 					t.mu.Unlock()
 				}
 			}
 		}
 
-		// 5. Finished!
+		// 8. Finished!
 		t.mu.Lock()
 		t.status = StatusSeeding
 		t.mu.Unlock()
