@@ -13,6 +13,9 @@ This project is a fully functional P2P Leech Engine that implements the core Bit
 * **State Resumption:** Safely pause and resume downloads. The engine hashes existing files on disk and automatically picks up exactly where it left off.
 * **Pipelining & State Management:** Implements the official BitTorrent Peer Wire Protocol (Handshakes, Choke/Unchoke, Bitfields, and Interested states) with high-speed request pipelining.
 * **Daemon Architecture:** A decoupled, stateful engine design ready to be hooked up to a Web UI, Desktop GUI, or rich Terminal UI.
+* **DHT Support :** Added DHT support for the torrent client.
+* **BubbleTea:** Added BubbleTea as a terminal UI for a cool look.
+* **Custom Seeding & Download Dependency:** More the seeding more will be the download speed given. Promotes good habit of seeding.  
 
 ## 📁 Project Structure
 
