@@ -22,8 +22,11 @@ func (h *Handshake) Serialize() []byte {
 	// Bytes 1-19: Protocol string
 	copy(buf[1:20], h.Pstr)
 
-	// Bytes 20-27: Reserved bytes (all zeros)
-	// Already zero from make()
+	// THE EXTENSION BIT (BEP 10)
+	// Bytes 20-27: Reserved bytes. We flip the 43rd bit to 1.
+	// This lives in byte 25 (the 6th reserved byte).
+	// It tells the peer: "Hey, I support Extended Messaging!"
+	buf[25] = 0x10
 
 	// Bytes 28-47: Info hash
 	copy(buf[28:48], h.InfoHash[:])

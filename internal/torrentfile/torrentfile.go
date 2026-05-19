@@ -161,6 +161,92 @@ func Open(path string) (*TorrentFile, error) {
 	return tf, nil
 }
 
+func ParseInfoDict(infoDict map[string]bencode.Value, infoHash [20]byte) (*TorrentFile, error) {
+	name, err := bencode.GetString(infoDict, "name")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get name: %w", err)
+	}
+
+	pieceLength, err := bencode.GetInt(infoDict, "piece length")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get piece length: %w", err)
+	}
+
+	pieces, err := bencode.GetString(infoDict, "pieces")
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pieces: %w", err)
+	}
+
+	length := int64(0)
+	var files []FileInfo
+
+	lengthVal, err := bencode.GetInt(infoDict, "length")
+	if err == nil {
+		// Single file torrent
+		length = lengthVal
+		files = append(files, FileInfo{
+			Length: int(length),
+			Path:   []string{name},
+		})
+	} else {
+		// Multi-file torrent
+		filesVal, ok := infoDict["files"]
+		if !ok {
+			return nil, fmt.Errorf("missing both length and files")
+		}
+
+		filesList, ok := filesVal.([]bencode.Value)
+		if !ok {
+			return nil, fmt.Errorf("files is not a list")
+		}
+		for _, f := range filesList {
+			fileDict, ok := f.(map[string]bencode.Value)
+			if !ok {
+				continue
+			}
+
+			fileLen, err := bencode.GetInt(fileDict, "length")
+			if err != nil {
+				continue
+			}
+
+			length += fileLen
+
+			pathVal, ok := fileDict["path"].([]bencode.Value)
+			if !ok {
+				continue
+			}
+
+			var path []string
+			for _, p := range pathVal {
+				if str, ok := p.(string); ok {
+					path = append(path, str)
+				}
+			}
+
+			files = append(files, FileInfo{
+				Length: int(fileLen),
+				Path:   path,
+			})
+		}
+	}
+
+	// Split pieces into hashes using existing internal helper
+	pieceHashes, err := splitPieceHashes(pieces)
+	if err != nil {
+		return nil, fmt.Errorf("failed to split piece hashes: %w", err)
+	}
+
+	return &TorrentFile{
+		InfoHash:    infoHash,
+		PieceHashes: pieceHashes,
+		PieceLength: int(pieceLength),
+		Length:      int(length),
+		Name:        name,
+		Files:       files,
+	}, nil
+}
+
 // parseAnnounceList converts bencode value to [][]string
 func parseAnnounceList(val bencode.Value) [][]string {
 	var result [][]string

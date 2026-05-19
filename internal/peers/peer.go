@@ -87,3 +87,10 @@ func (c *Client) SendRequest(index, begin, length int) error {
 func (c *Client) SendHave(index int) error {
 	return c.SendMessage(FormatHave(index))
 }
+
+func (c *Client) SendExtendedMessage(payload []byte) error {
+	return c.SendMessage(&Message{
+		ID:      MsgExtended,
+		Payload: payload,
+	})
+}

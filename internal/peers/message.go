@@ -19,6 +19,7 @@ const (
 	MsgRequest       MessageID = 6
 	MsgPiece         MessageID = 7
 	MsgCancel        MessageID = 8
+	MsgExtended      MessageID = 20
 )
 
 // Message represents a peer wire protocol message
