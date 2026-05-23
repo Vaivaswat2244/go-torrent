@@ -23,7 +23,6 @@ const (
 	StatusStopped     Status = "Stopped"
 )
 
-// TorrentStats is the clean data package we hand to the UI
 type TorrentStats struct {
 	Name        string
 	Progress    float64
@@ -32,14 +31,12 @@ type TorrentStats struct {
 	PeersActive int
 }
 
-// Torrent is the actual engine running the download
 type Torrent struct {
 	TF     *torrentfile.TorrentFile
 	Writer *p2p.MultiFileWriter
 
 	bitfield p2p.Bitfield
 
-	// State variables (protected by Mutex for concurrent UI access)
 	mu             sync.RWMutex
 	status         Status
 	piecesDone     int
@@ -47,14 +44,12 @@ type Torrent struct {
 	bytesSinceLast time.Time
 	activePeers    int
 
-	sessionPieces int       // Pieces downloaded *this* time
-	startTime     time.Time // When we started
+	sessionPieces int
+	startTime     time.Time
 
-	// Channels
 	stopChan chan struct{}
 }
 
-// NewTorrent initializes the state
 func NewTorrent(tf *torrentfile.TorrentFile, outDir string) (*Torrent, error) {
 	writer, err := p2p.NewMultiFileWriter(outDir, tf)
 	if err != nil {
@@ -71,13 +66,11 @@ func NewTorrent(tf *torrentfile.TorrentFile, outDir string) (*Torrent, error) {
 }
 
 func (t *Torrent) VerifyExistingState() {
-	// Initialize an empty bitfield of the correct size
 	t.bitfield = make(p2p.Bitfield, int(math.Ceil(float64(t.totalPieces)/8.0)))
 
 	fmt.Printf("🔍 Scanning existing files for %s...\n", t.TF.Name)
 
 	for i, expectedHash := range t.TF.PieceHashes {
-		// Calculate expected length (handling the last piece)
 		length := t.TF.PieceLength
 		if i == t.totalPieces-1 {
 			remainder := t.TF.Length % t.TF.PieceLength
@@ -86,10 +79,8 @@ func (t *Torrent) VerifyExistingState() {
 			}
 		}
 
-		// Try to read the piece
 		data, err := t.Writer.ReadPiece(i, length)
 		if err == nil {
-			// Hash it and compare!
 			actualHash := sha1.Sum(data)
 			if actualHash == expectedHash {
 				t.bitfield.SetPiece(i)
@@ -101,10 +92,9 @@ func (t *Torrent) VerifyExistingState() {
 	fmt.Printf("✅ Resume State: Found %d/%d valid pieces.\n", t.piecesDone, t.totalPieces)
 }
 
-// GetStats safely reads the current state for the UI
 func (t *Torrent) GetStats() TorrentStats {
-	t.mu.RLock()         // Lock for reading
-	defer t.mu.RUnlock() // Unlock when function returns
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 
 	progress := 0.0
 	if t.totalPieces > 0 {
@@ -116,7 +106,7 @@ func (t *Torrent) GetStats() TorrentStats {
 		elapsed := time.Since(t.startTime).Seconds()
 		if elapsed > 0 {
 			bytesDownloaded := float64(t.sessionPieces * t.TF.PieceLength)
-			speed = bytesDownloaded / elapsed / 1024 / 1024 // Convert to MB/s
+			speed = bytesDownloaded / elapsed / 1024 / 1024
 		}
 	}
 
@@ -129,18 +119,14 @@ func (t *Torrent) GetStats() TorrentStats {
 	}
 }
 
-// Start begins the download in the background
-// Start begins the download in the background
 func (t *Torrent) Start(peerID [20]byte, port uint16) {
 	t.mu.Lock()
 	t.status = StatusStarting
 	t.startTime = time.Now()
 	t.mu.Unlock()
 
-	// 1. Verify what we already have on disk
 	t.VerifyExistingState()
 
-	// Launch the main orchestrator in a background goroutine
 	go func() {
 		defer t.Writer.Close()
 
@@ -148,12 +134,11 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 		t.status = StatusDownloading
 		t.mu.Unlock()
 
-		// 2. Setup Channels
-		peerChan := make(chan torrentfile.Peer, 100) // Buffer for incoming peers
+		peerChan := make(chan torrentfile.Peer, 500)
 		workQueue := make(chan *p2p.PieceWork, t.totalPieces)
-		results := make(chan *p2p.PieceResult)
+		results := make(chan *p2p.PieceResult, 100)
 
-		// 3. Populate Work Queue (Shuffled for Rarest-First emulation)
+		// Populate work queue
 		var missingPieces []int
 		for i := 0; i < t.totalPieces; i++ {
 			if !t.bitfield.HasPiece(i) {
@@ -178,40 +163,57 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 			workQueue <- &p2p.PieceWork{Index: i, Hash: hash, Length: length}
 		}
 
-		// 4. 🚀 LAUNCH THE TRACKER (Background)
+		// Launch tracker
 		go func() {
 			peers, err := t.TF.RequestPeers(peerID, port)
 			if err == nil {
 				for _, p := range peers {
-					peerChan <- p
+					select {
+					case peerChan <- p:
+					default:
+					}
 				}
 			}
 		}()
 
-		// 5. 🚀 LAUNCH THE DHT CRAWLER (Background)
+		// Launch DHT
 		go dht.FindPeers(t.TF.InfoHash, peerChan)
 
-		// 6. The Peer Manager (Listens for peers and launches workers dynamically)
+		// Peer manager — launches workers, tracks active count, retries dead workers
 		go func() {
 			seenPeers := make(map[string]bool)
 			for peer := range peerChan {
 				addr := peer.String()
-
-				// Deduplicate: Only launch a worker if we haven't seen this IP yet
-				if !seenPeers[addr] {
-					seenPeers[addr] = true
-
-					t.mu.Lock()
-					t.activePeers++
-					t.mu.Unlock()
-
-					// Launch a new worker for this newly discovered peer!
-					go p2p.Worker(peer, t.TF, peerID, t.bitfield, workQueue, results)
+				if seenPeers[addr] {
+					continue
 				}
+				seenPeers[addr] = true
+
+				t.mu.Lock()
+				t.activePeers++
+				t.mu.Unlock()
+
+				go func(p torrentfile.Peer) {
+					defer func() {
+						t.mu.Lock()
+						t.activePeers--
+						t.mu.Unlock()
+					}()
+
+					// Retry peer up to 3 times before giving up
+					for i := 0; i < 3; i++ {
+						p2p.Worker(p, t.TF, peerID, t.bitfield, workQueue, results)
+						// If work queue is empty, we're done — no need to retry
+						if len(workQueue) == 0 {
+							return
+						}
+						time.Sleep(time.Duration(i+1) * 2 * time.Second)
+					}
+				}(peer)
 			}
 		}()
 
-		// 7. Collect Results
+		// Collect results
 		for t.piecesDone < t.totalPieces {
 			select {
 			case <-t.stopChan:
@@ -220,21 +222,17 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 				t.mu.Unlock()
 				return
 			case res := <-results:
-				// Write to disk
 				err := t.Writer.WritePiece(res.Index, res.Buf)
 				if err == nil {
 					t.mu.Lock()
 					t.piecesDone++
 					t.sessionPieces++
-
-					// Update our bitfield so we know we have it
 					t.bitfield.SetPiece(res.Index)
 					t.mu.Unlock()
 				}
 			}
 		}
 
-		// 8. Finished!
 		t.mu.Lock()
 		t.status = StatusSeeding
 		t.mu.Unlock()
@@ -242,7 +240,6 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 	}()
 }
 
-// Stop allows the UI to halt the download
 func (t *Torrent) Stop() {
 	close(t.stopChan)
 }
