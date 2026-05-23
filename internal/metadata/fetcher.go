@@ -13,7 +13,7 @@ import (
 )
 
 // Fetch coordinates the downloading of the .torrent metadata from peers
-func Fetch(infoHash [20]byte, peerID [20]byte, peerChan chan torrentfile.Peer) ([]byte, error) {
+func Fetch(infoHash [20]byte, peerID [20]byte, peerChan <-chan torrentfile.Peer) ([]byte, error) {
 	fmt.Println("🔍 Searching the DHT for metadata... (racing peers)")
 
 	resultChan := make(chan []byte)
@@ -27,12 +27,13 @@ func Fetch(infoHash [20]byte, peerID [20]byte, peerChan chan torrentfile.Peer) (
 					// Verify the downloaded metadata matches our magnet link
 					hash := sha1.Sum(infoBytes)
 					if bytes.Equal(hash[:], infoHash[:]) {
-						// Non-blocking send in case multiple workers succeed at the exact same time
 						select {
 						case resultChan <- infoBytes:
 						default:
 						}
 						return
+					} else {
+						fmt.Printf("  [%s] hash mismatch — got %x\n", peer, hash)
 					}
 				}
 			}
@@ -52,27 +53,27 @@ func Fetch(infoHash [20]byte, peerID [20]byte, peerChan chan torrentfile.Peer) (
 func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte, error) {
 	conn, err := net.DialTimeout("tcp", peer.String(), 3*time.Second)
 	if err != nil {
+		fmt.Printf("  [%s] dial failed: %v\n", peer, err)
 		return nil, err
 	}
 	defer conn.Close()
+	fmt.Printf("  [%s] TCP connected\n", peer)
 
 	// 1. Standard Handshake
 	client, err := peers.CompleteHandshake(conn, infoHash, peerID)
 	if err != nil {
+		fmt.Printf("  [%s] handshake failed: %v\n", peer, err)
 		return nil, err
 	}
+	fmt.Printf("  [%s] handshake OK\n", peer)
 
 	// 2. Send Extended Handshake (BEP 10)
-	// We tell them our ut_metadata ID is 1
 	extHandshake := map[string]interface{}{
 		"m": map[string]interface{}{
 			"ut_metadata": 1,
 		},
 	}
 	encodedHandshake, _ := bencode.Encode(extHandshake)
-
-	// Payload: [ExtendedMsgID (1 byte)] + [Bencoded Dict]
-	// ID 0 represents the Initial Extended Handshake
 	payload := append([]byte{0}, encodedHandshake...)
 	client.SendExtendedMessage(payload)
 
@@ -85,7 +86,8 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 	for i := 0; i < 150; i++ {
 		msg, err := client.ReadMessage()
 		if err != nil {
-			return nil, err
+			fmt.Printf("  [%s] read error waiting for ext handshake: %v\n", peer, err)
+			break
 		}
 		if msg == nil {
 			continue
@@ -93,9 +95,10 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 
 		if msg.ID == peers.MsgExtended && len(msg.Payload) > 1 {
 			extID := msg.Payload[0]
-			if extID == 0 { // They sent us an Extended Handshake!
+			if extID == 0 {
 				dict, err := bencode.Decode(msg.Payload[1:])
 				if err != nil {
+					fmt.Printf("  [%s] failed to decode ext handshake: %v\n", peer, err)
 					continue
 				}
 
@@ -104,12 +107,10 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 					continue
 				}
 
-				// Extract metadata size
 				if size, err := bencode.GetInt(respMap, "metadata_size"); err == nil {
 					metadataSize = size
 				}
 
-				// Extract their ut_metadata ID
 				if mDict, err := bencode.GetDict(respMap, "m"); err == nil {
 					if id, err := bencode.GetInt(mDict, "ut_metadata"); err == nil {
 						theirMetadataID = id
@@ -121,43 +122,56 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 	}
 
 	if metadataSize == 0 || theirMetadataID == 0 {
-		return nil, fmt.Errorf("peer does not support ut_metadata")
+		fmt.Printf("  [%s] no ut_metadata (size=%d id=%d)\n", peer, metadataSize, theirMetadataID)
+		return nil, fmt.Errorf("peer did not send ut_metadata handshake in time")
 	}
 
-	// 4. Request the Metadata Pieces (BEP 9)
-	// Standard metadata piece size is 16KB (16384 bytes)
+	fmt.Printf("  [%s] got ut_metadata: size=%d pieces=%d\n", peer, metadataSize, (metadataSize+16383)/16384)
+
+	// 4. Request Metadata Pieces (BEP 9)
 	client.Conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	numPieces := (metadataSize + 16383) / 16384
 	var rawInfo []byte
 
 	for piece := int64(0); piece < numPieces; piece++ {
 		reqDict := map[string]interface{}{
-			"msg_type": 0, // 0 = request
+			"msg_type": 0,
 			"piece":    piece,
 		}
 		encodedReq, _ := bencode.Encode(reqDict)
-
-		// Payload: [Their Metadata ID] + [Bencoded Request Dict]
 		reqPayload := append([]byte{byte(theirMetadataID)}, encodedReq...)
 		client.SendExtendedMessage(reqPayload)
 
-		// Read the piece response
-		msg, err := client.ReadMessage()
-		if err != nil || msg == nil || msg.ID != peers.MsgExtended {
-			return nil, fmt.Errorf("failed to get metadata piece")
+		var msg *peers.Message
+		for {
+			m, err := client.ReadMessage()
+			if err != nil {
+				fmt.Printf("  [%s] read error waiting for piece %d: %v\n", peer, piece, err)
+				return nil, fmt.Errorf("failed to get metadata piece %d", piece)
+			}
+			if m == nil {
+				continue // keep-alive
+			}
+			if m.ID == peers.MsgExtended {
+				msg = m
+				break
+			}
+			// Skip Bitfield, Have, Unchoke, etc.
+			fmt.Printf("  [%s] skipping msg ID=%d while waiting for piece %d\n", peer, m.ID, piece)
 		}
 
-		// The response payload is: [Extended ID] + [Bencoded Dict] + [Raw Binary Data]
-		// Bencode natively stops parsing exactly where the dict ends,
-		// leaving the raw binary data right after it.
-		// For our simple crawler, we will do a fast byte-search for the end of the dict ("ee").
-		idx := bytes.Index(msg.Payload[1:], []byte("ee"))
-		if idx == -1 {
-			return nil, fmt.Errorf("invalid metadata piece response")
+		// The response is: [Extended ID byte] + [Bencoded dict] + [Raw piece data]
+		// Use proper bencode parsing to find exactly where the dict ends
+		// instead of searching for "ee" which can appear in binary data
+		payload := msg.Payload[1:] // strip the extended msg ID byte
+		_, consumed, err := bencode.DecodeWithLength(payload)
+		if err != nil {
+			fmt.Printf("  [%s] failed to decode piece %d response dict: %v\n", peer, piece, err)
+			return nil, fmt.Errorf("failed to decode piece response dict: %v", err)
 		}
 
-		// The binary data starts right after the "ee"
-		pieceData := msg.Payload[1+idx+2:]
+		pieceData := payload[consumed:]
+		fmt.Printf("  [%s] got piece %d (%d bytes)\n", peer, piece, len(pieceData))
 		rawInfo = append(rawInfo, pieceData...)
 	}
 
