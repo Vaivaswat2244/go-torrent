@@ -183,3 +183,12 @@ func GetDict(dict map[string]Value, key string) (map[string]Value, error) {
 	}
 	return d, nil
 }
+
+// DecodeWithLength parses bencoded data and also returns how many bytes were consumed
+func DecodeWithLength(data []byte) (Value, int, error) {
+	value, consumed, err := decodeValue(data, 0)
+	if err != nil {
+		return nil, 0, err
+	}
+	return value, consumed, nil
+}
