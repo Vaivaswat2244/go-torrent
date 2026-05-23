@@ -39,9 +39,37 @@ func main() {
 
 		// 1. Create a channel for peers
 		peerChan := make(chan torrentfile.Peer, 100)
+		debugChan := make(chan torrentfile.Peer, 100)
+
+		go func() {
+			count := 0
+			for p := range debugChan {
+				count++
+				fmt.Printf("🟢 Peer #%d: %s\n", count, p.String())
+				peerChan <- p
+			}
+		}()
 
 		// 2. Start the DHT Crawler in the background
-		go dht.FindPeers(mag.InfoHash, peerChan)
+		go dht.FindPeers(mag.InfoHash, debugChan)
+		tempTF := mag.ToTorrentFile()
+		for _, trackerURL := range mag.Trackers {
+			trackerURL := trackerURL
+			go func() {
+				peers, err := tempTF.RequestPeersUDP(trackerURL, peerID, 6881)
+				if err != nil {
+					fmt.Printf("❌ Tracker %s failed: %v\n", trackerURL, err)
+					return
+				}
+				fmt.Printf("✅ Tracker %s returned %d peers\n", trackerURL, len(peers))
+				for _, p := range peers {
+					select {
+					case debugChan <- p:
+					default:
+					}
+				}
+			}()
+		}
 
 		// 3. Pause and wait for the Metadata Fetcher!
 		// THIS replaces the "stub" logic. It downloads the real piece hashes over TCP!
