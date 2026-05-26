@@ -163,23 +163,44 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 			workQueue <- &p2p.PieceWork{Index: i, Hash: hash, Length: length}
 		}
 
-		// Launch tracker
+		// 4. Launch all trackers (works for both .torrent and magnet)
 		go func() {
-			peers, err := t.TF.RequestPeers(peerID, port)
-			if err == nil {
-				for _, p := range peers {
-					select {
-					case peerChan <- p:
-					default:
+			// For .torrent files with an Announce URL
+			if t.TF.Announce != "" {
+				peers, err := t.TF.RequestPeers(peerID, port)
+				if err == nil {
+					for _, p := range peers {
+						select {
+						case peerChan <- p:
+						default:
+						}
 					}
 				}
 			}
+
+			// For magnet links and announce-list trackers — scrape all in parallel
+			for _, trackerURL := range t.TF.Trackers {
+				trackerURL := trackerURL
+				go func() {
+					peers, err := t.TF.RequestPeersUDP(trackerURL, peerID, port)
+					if err != nil {
+						return
+					}
+					fmt.Printf("📡 Tracker %s returned %d peers\n", trackerURL, len(peers))
+					for _, p := range peers {
+						select {
+						case peerChan <- p:
+						default:
+						}
+					}
+				}()
+			}
 		}()
 
-		// Launch DHT
+		// 5. Launch DHT crawler
 		go dht.FindPeers(t.TF.InfoHash, peerChan)
 
-		// Peer manager — launches workers, tracks active count, retries dead workers
+		// 6. Peer manager
 		go func() {
 			seenPeers := make(map[string]bool)
 			for peer := range peerChan {
@@ -200,10 +221,8 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 						t.mu.Unlock()
 					}()
 
-					// Retry peer up to 3 times before giving up
 					for i := 0; i < 3; i++ {
 						p2p.Worker(p, t.TF, peerID, t.bitfield, workQueue, results)
-						// If work queue is empty, we're done — no need to retry
 						if len(workQueue) == 0 {
 							return
 						}
@@ -213,7 +232,7 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 			}
 		}()
 
-		// Collect results
+		// 7. Collect results
 		for t.piecesDone < t.totalPieces {
 			select {
 			case <-t.stopChan:
@@ -233,6 +252,7 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 			}
 		}
 
+		// 8. Done
 		t.mu.Lock()
 		t.status = StatusSeeding
 		t.mu.Unlock()
