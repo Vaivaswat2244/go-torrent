@@ -78,6 +78,6 @@ func (m *Magnet) ToTorrentFile() *torrentfile.TorrentFile {
 	return &torrentfile.TorrentFile{
 		Name:     m.Name,
 		InfoHash: m.InfoHash,
-		Announce: "", // We can use m.Trackers[0] if it exists
+		Trackers: m.Trackers, // ADD
 	}
 }
