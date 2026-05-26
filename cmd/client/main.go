@@ -93,6 +93,7 @@ func main() {
 		}
 
 		tf.Name = mag.Name
+		tf.Trackers = mag.Trackers
 		fmt.Printf("📁 Metadata Downloaded! Size: %.2f MB\n", float64(tf.Length)/1024/1024)
 
 	} else {
