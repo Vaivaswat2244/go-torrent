@@ -14,7 +14,6 @@ import (
 
 // Fetch coordinates the downloading of the .torrent metadata from peers
 func Fetch(infoHash [20]byte, peerID [20]byte, peerChan <-chan torrentfile.Peer) ([]byte, error) {
-	fmt.Println("🔍 Searching the DHT for metadata... (racing peers)")
 
 	resultChan := make(chan []byte)
 
@@ -53,19 +52,15 @@ func Fetch(infoHash [20]byte, peerID [20]byte, peerChan <-chan torrentfile.Peer)
 func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte, error) {
 	conn, err := net.DialTimeout("tcp", peer.String(), 3*time.Second)
 	if err != nil {
-		fmt.Printf("  [%s] dial failed: %v\n", peer, err)
 		return nil, err
 	}
 	defer conn.Close()
-	fmt.Printf("  [%s] TCP connected\n", peer)
 
 	// 1. Standard Handshake
 	client, err := peers.CompleteHandshake(conn, infoHash, peerID)
 	if err != nil {
-		fmt.Printf("  [%s] handshake failed: %v\n", peer, err)
 		return nil, err
 	}
-	fmt.Printf("  [%s] handshake OK\n", peer)
 
 	// 2. Send Extended Handshake (BEP 10)
 	extHandshake := map[string]interface{}{
@@ -86,7 +81,6 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 	for i := 0; i < 150; i++ {
 		msg, err := client.ReadMessage()
 		if err != nil {
-			fmt.Printf("  [%s] read error waiting for ext handshake: %v\n", peer, err)
 			break
 		}
 		if msg == nil {
@@ -98,7 +92,6 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 			if extID == 0 {
 				dict, err := bencode.Decode(msg.Payload[1:])
 				if err != nil {
-					fmt.Printf("  [%s] failed to decode ext handshake: %v\n", peer, err)
 					continue
 				}
 
@@ -122,11 +115,8 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 	}
 
 	if metadataSize == 0 || theirMetadataID == 0 {
-		fmt.Printf("  [%s] no ut_metadata (size=%d id=%d)\n", peer, metadataSize, theirMetadataID)
-		return nil, fmt.Errorf("peer did not send ut_metadata handshake in time")
+		return nil, err
 	}
-
-	fmt.Printf("  [%s] got ut_metadata: size=%d pieces=%d\n", peer, metadataSize, (metadataSize+16383)/16384)
 
 	// 4. Request Metadata Pieces (BEP 9)
 	client.Conn.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -146,8 +136,7 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 		for {
 			m, err := client.ReadMessage()
 			if err != nil {
-				fmt.Printf("  [%s] read error waiting for piece %d: %v\n", peer, piece, err)
-				return nil, fmt.Errorf("failed to get metadata piece %d", piece)
+				return nil, err
 			}
 			if m == nil {
 				continue // keep-alive
@@ -157,7 +146,6 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 				break
 			}
 			// Skip Bitfield, Have, Unchoke, etc.
-			fmt.Printf("  [%s] skipping msg ID=%d while waiting for piece %d\n", peer, m.ID, piece)
 		}
 
 		// The response is: [Extended ID byte] + [Bencoded dict] + [Raw piece data]
@@ -166,12 +154,10 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 		payload := msg.Payload[1:] // strip the extended msg ID byte
 		_, consumed, err := bencode.DecodeWithLength(payload)
 		if err != nil {
-			fmt.Printf("  [%s] failed to decode piece %d response dict: %v\n", peer, piece, err)
-			return nil, fmt.Errorf("failed to decode piece response dict: %v", err)
+			return nil, err
 		}
 
 		pieceData := payload[consumed:]
-		fmt.Printf("  [%s] got piece %d (%d bytes)\n", peer, piece, len(pieceData))
 		rawInfo = append(rawInfo, pieceData...)
 	}
 
