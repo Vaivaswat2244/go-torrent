@@ -1,57 +1,27 @@
-# Go-Torrent
+# go-torrent
 
-A high-performance, concurrent BitTorrent client built from scratch in Go. 
+A BitTorrent client written in Go with a terminal UI.
 
-This project is a fully functional P2P Leech Engine that implements the core BitTorrent protocol (BEP-3) and UDP Tracker protocol (BEP-15) entirely from the ground up, without relying on third-party torrenting libraries.
+## Features
+- Magnet link support via DHT + UDP trackers
+- .torrent file support  
+- Terminal UI with progress bar
+- Multi-file torrent support
+- Resume downloads
 
-## 🚀 Features
+## Install
 
-* **Custom Bencode Parser:** A robust, zero-dependency parser for decoding `.torrent` files and tracker responses.
-* **Tracker Support:** Fully implements both HTTP/HTTPS and UDP tracker protocols.
-* **Concurrent Worker Pool:** Uses Go channels and goroutines to manage a dynamic worker pool, downloading multiple pieces from dozens of peers simultaneously.
-* **Multi-File Support:** Flawlessly handles complex directory structures, calculating global byte offsets to slice and distribute pieces across multiple files on disk.
-* **State Resumption:** Safely pause and resume downloads. The engine hashes existing files on disk and automatically picks up exactly where it left off.
-* **Pipelining & State Management:** Implements the official BitTorrent Peer Wire Protocol (Handshakes, Choke/Unchoke, Bitfields, and Interested states) with high-speed request pipelining.
-* **Daemon Architecture:** A decoupled, stateful engine design ready to be hooked up to a Web UI, Desktop GUI, or rich Terminal UI.
-* **DHT Support :** Added DHT support for the torrent client.
-* **BubbleTea:** Added BubbleTea as a terminal UI for a cool look.
-* **Custom Seeding & Download Dependency:** More the seeding more will be the download speed given. Promotes good habit of seeding.  
+Download the binary for your platform from [Releases](https://github.com/Vaivaswat2244/go-torrent/releases).
 
-## 📁 Project Structure
+Or build from source:
+    go install github.com/Vaivaswat2244/go-torrent/cmd/client@latest
 
-The codebase strictly follows standard Go project layout conventions:
+## Usage
 
-* `/cmd/client/` - The entry point of the application (the CLI daemon).
-* `/internal/bencode/` - Custom bencode decoding logic.
-* `/internal/engine/` - The stateful orchestrator that manages torrent sessions, disk I/O, and UI statistics.
-* `/internal/p2p/` - The core peer-to-peer logic, worker pools, piece hashing, and the `MultiFileWriter`.
-* `/internal/peers/` - The Peer Wire Protocol (TCP handshakes, message framing, and state).
-* `/internal/torrentfile/` - `.torrent` file parsing and Tracker communication (HTTP & UDP).
+    go-torrent [-output <dir>]
 
-## 🛠️ Installation
+Then choose torrent file or magnet link from the menu.
 
-Ensure you have Go installed (1.18+ recommended). Clone the repository and build the binary:
+## Options
 
-    git clone [https://github.com/Vaivaswat2244/go-torrent.git](https://github.com/Vaivaswat2244/go-torrent.git)
-    cd go-torrent
-    go build -o bin/torrent ./cmd/client
-
-## 💻 Usage
-
-Run the compiled binary and point it to a valid `.torrent` file.
-
-Download to the current directory:
-
-    ./bin/torrent -torrent path/to/debian.torrent
-
-Download to a specific output directory:
-
-    ./bin/torrent -torrent path/to/ubuntu.torrent -output /Downloads/ISOs/
-
-### Stopping & Resuming
-You can safely stop the daemon at any time using `Ctrl+C`. When you restart the command, `go-torrent` will scan your output directory, verify the SHA-1 hashes of the existing pieces, and resume downloading only the missing data.
-
-
-## 📄 License
-
-This project is open-source and available under the MIT License.
+    -output   Output directory (default: current directory)
