@@ -73,11 +73,13 @@ type model struct {
 
 	peerID    [20]byte
 	outputDir string
+	port      uint16
+	limits    engine.Limits
 	errText   string
 	width     int
 }
 
-func initialModel(peerID [20]byte, outputDir string) model {
+func initialModel(peerID [20]byte, outputDir string, port uint16, limits engine.Limits) model {
 	ti := textinput.New()
 	ti.CharLimit = 512
 	ti.Width = 60
@@ -93,6 +95,8 @@ func initialModel(peerID [20]byte, outputDir string) model {
 		progress:  p,
 		peerID:    peerID,
 		outputDir: outputDir,
+		port:      port,
+		limits:    limits,
 	}
 }
 
@@ -190,7 +194,7 @@ func (m model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			m.fetchCancel = cancel
-			return m, fetchMagnetMetadata(ctx, val, m.peerID)
+			return m, fetchMagnetMetadata(ctx, val, m.peerID, m.port)
 		}
 	}
 
@@ -243,15 +247,22 @@ func (m model) updateDownload(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.stats = m.torrent.GetStats()
 
 		switch m.stats.Status {
-		case engine.StatusSeeding:
-			m.screen = screenDone
-			return m, nil
 		case engine.StatusError:
 			m.screen = screenError
 			m.errText = m.torrent.Err()
 			return m, nil
+
+		case engine.StatusStopped:
+			// Only reached once seeding hits a ratio or time limit.
+			if m.stats.Progress >= 100 {
+				m.screen = screenDone
+				return m, nil
+			}
 		}
 
+		// Seeding keeps the screen live. Switching to a static "done" screen
+		// here used to stop rescheduling tick(), which also broke the event log
+		// because the waitForLog re-arm chain only runs on this screen.
 		cmd := m.progress.SetPercent(m.stats.Progress / 100.0)
 		return m, tea.Batch(tick(), cmd)
 
@@ -280,7 +291,7 @@ func loadTorrentFile(path string) tea.Cmd {
 	}
 }
 
-func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte) tea.Cmd {
+func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte, port uint16) tea.Cmd {
 	return func() tea.Msg {
 		mag, err := magnet.Parse(uri)
 		if err != nil {
@@ -293,7 +304,7 @@ func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte) tea.C
 		tempTF := mag.ToTorrentFile()
 		req := torrentfile.AnnounceReq{
 			PeerID: peerID,
-			Port:   listenPort,
+			Port:   port,
 			Left:   -1, // real size is unknown until metadata arrives
 			Event:  torrentfile.EventStarted,
 		}
@@ -351,7 +362,7 @@ func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte) tea.C
 }
 
 func (m model) startDownload(tf *torrentfile.TorrentFile) (tea.Model, tea.Cmd) {
-	t, err := engine.NewTorrent(tf, m.outputDir)
+	t, err := engine.NewTorrentWithLimits(tf, m.outputDir, m.limits)
 	if err != nil {
 		m.screen = screenError
 		m.errText = err.Error()
@@ -359,7 +370,7 @@ func (m model) startDownload(tf *torrentfile.TorrentFile) (tea.Model, tea.Cmd) {
 	}
 	m.torrent = t
 	m.screen = screenDownload
-	t.Start(m.peerID, listenPort)
+	t.Start(m.peerID, m.port)
 	return m, tea.Batch(tick(), waitForLog(t), m.progress.SetPercent(0))
 }
 
@@ -431,20 +442,31 @@ func (m model) viewDownload() string {
 	}
 
 	sizeLine := fmt.Sprintf("%s / %s", humanBytes(s.Downloaded), humanBytes(s.Total))
-	speedLine := humanBytes(int64(s.SpeedBps)) + "/s"
 
-	etaLine := "--"
-	if s.ETA > 0 {
-		etaLine = formatDuration(s.ETA)
-	}
-
-	info := strings.Join([]string{
+	rows := []string{
 		row("Status:  ", statusColor(s.Status).Render(string(s.Status))),
 		row("File:    ", truncate(s.Name, 38)),
 		row("Size:    ", sizeLine),
-		row("Speed:   ", speedLine),
-		row("ETA:     ", etaLine),
-	}, "\n")
+	}
+
+	seeding := s.Status == engine.StatusSeeding
+	if !seeding {
+		etaLine := "--"
+		if s.ETA > 0 {
+			etaLine = formatDuration(s.ETA)
+		}
+		rows = append(rows,
+			row("Down:    ", humanBytes(int64(s.SpeedBps))+"/s"),
+			row("ETA:     ", etaLine),
+		)
+	}
+
+	rows = append(rows,
+		row("Up:      ", humanBytes(int64(s.UploadBps))+"/s"),
+		row("Uploaded:", fmt.Sprintf("%s  (ratio %.2f)", humanBytes(s.Uploaded), s.Ratio)),
+	)
+
+	info := strings.Join(rows, "\n")
 
 	bar := "\n" + m.progress.View() + "\n" +
 		dimStyle.Render(fmt.Sprintf("%.2f%%", s.Progress))
@@ -454,7 +476,9 @@ func (m model) viewDownload() string {
 	rightPanel := boxStyle.Render(
 		subtitleStyle.Bold(true).Render("🌐 Network") + "\n\n" +
 			valueStyle.Render(fmt.Sprintf("%d", s.PeersActive)) + "\n" +
-			dimStyle.Render("connected peers"),
+			dimStyle.Render("connected peers") + "\n\n" +
+			valueStyle.Render(fmt.Sprintf("%d", s.PeersUnchoked)) + "\n" +
+			dimStyle.Render("being served"),
 	)
 
 	panels := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
@@ -470,13 +494,19 @@ func (m model) viewDownload() string {
 		out += "\n" + boxStyle.Render(strings.Join(lines, "\n"))
 	}
 
-	return out + "\n" + helpStyle.Render("q to quit")
+	help := "q to quit"
+	if seeding {
+		help = "seeding · q to stop and quit"
+	}
+	return out + "\n" + helpStyle.Render(help)
 }
 
 func (m model) viewDone() string {
 	content := lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true).
-		Render("✅ Download complete!") +
-		"\n\n" + dimStyle.Render(m.stats.Name)
+		Render("✅ Done seeding") +
+		"\n\n" + dimStyle.Render(m.stats.Name) +
+		"\n" + dimStyle.Render(fmt.Sprintf("uploaded %s (ratio %.2f)",
+		humanBytes(m.stats.Uploaded), m.stats.Ratio))
 	return titleStyle.Render("⚡ go-torrent") + "\n" +
 		boxStyle.Render(content) + "\n" +
 		helpStyle.Render("enter or q to exit")
@@ -531,6 +561,8 @@ func statusColor(s engine.Status) lipgloss.Style {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Bold(true)
 	case engine.StatusSeeding:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true)
+	case engine.StatusStopped:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Bold(true)
 	case engine.StatusError, engine.StatusStalled:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 	default:
@@ -580,8 +612,8 @@ func truncate(s string, max int) string {
 	return string(r[:max-3]) + "..."
 }
 
-func runTUI(peerID [20]byte, outputDir string) {
-	m := initialModel(peerID, outputDir)
+func runTUI(peerID [20]byte, outputDir string, port uint16, limits engine.Limits) {
+	m := initialModel(peerID, outputDir, port, limits)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatalf("TUI error: %v", err)

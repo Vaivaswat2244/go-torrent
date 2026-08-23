@@ -3,16 +3,14 @@ package p2p
 import (
 	"crypto/sha1"
 	"fmt"
-	"time"
-
-	"github.com/Vaivaswat2244/go-torrent/internal/peers"
 )
 
-const MaxBlockSize = 16384 // 16 KB - standard block size
+// MaxBlockSize is the standard block size peers request. It is also the largest
+// block we are willing to serve.
+const MaxBlockSize = 16384
 
-// MaxBacklog is how many block requests we keep in flight per peer. This was
-// 100 (1.6 MB outstanding), which many peers treat as abusive and drop; 5 is
-// the conventional figure and is enough to keep the pipe full.
+// MaxBacklog is how many block requests we keep in flight per peer. Five is the
+// conventional figure and is enough to keep the pipe full.
 const MaxBacklog = 5
 
 // PieceWork represents a work item: download this piece
@@ -26,76 +24,6 @@ type PieceWork struct {
 type PieceResult struct {
 	Index int
 	Buf   []byte
-}
-
-// Download downloads a piece from a peer
-func (pw *PieceWork) Download(client *peers.Client) ([]byte, error) {
-	// Create buffer for the piece
-	buf := make([]byte, pw.Length)
-	downloaded := 0
-	backlog := 0
-	requested := 0
-
-	for downloaded < pw.Length {
-		// If not choked, send requests
-		if !client.Choked {
-			for backlog < MaxBacklog && requested < pw.Length {
-				blockSize := MaxBlockSize
-				if pw.Length-requested < blockSize {
-					blockSize = pw.Length - requested
-				}
-
-				// Request a block
-				err := client.SendRequest(pw.Index, requested, blockSize)
-				if err != nil {
-					return nil, err
-				}
-
-				backlog++
-				requested += blockSize
-			}
-		}
-
-		// Read message from peer
-		client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
-		msg, err := client.ReadMessage()
-		if err != nil {
-			return nil, err
-		}
-
-		if msg == nil {
-			// Keep-alive message
-			continue
-		}
-
-		switch msg.ID {
-		case peers.MsgUnchoke:
-			client.Choked = false
-
-		case peers.MsgChoke:
-			client.Choked = true
-
-		case peers.MsgHave:
-			index, err := peers.ParseHave(msg)
-			if err != nil {
-				return nil, err
-			}
-			// This used to append the index as a raw byte, which grew the
-			// bitfield with garbage that made HasPiece report pieces the peer
-			// did not have. Set the bit instead.
-			Bitfield(client.Bitfield).SetPiece(index)
-
-		case peers.MsgPiece:
-			n, err := peers.ParsePiece(pw.Index, buf, msg)
-			if err != nil {
-				return nil, err
-			}
-			downloaded += n
-			backlog--
-		}
-	}
-
-	return buf, nil
 }
 
 // CheckIntegrity verifies the downloaded piece matches the hash

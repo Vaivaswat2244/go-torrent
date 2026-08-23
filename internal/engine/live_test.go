@@ -66,8 +66,10 @@ loop:
 			break loop
 		case <-ticker.C:
 			last = tor.GetStats()
-			t.Logf("%-12s %6.2f%%  %.2f MB/s  peers=%d  eta=%s",
-				last.Status, last.Progress, last.SpeedBps/1024/1024, last.PeersActive, last.ETA)
+			t.Logf("%-12s %6.2f%%  down %.2f MB/s  up %.2f MB/s  peers=%d (%d served)  uploaded %d  eta=%s",
+				last.Status, last.Progress,
+				last.SpeedBps/1024/1024, last.UploadBps/1024/1024,
+				last.PeersActive, last.PeersUnchoked, last.Uploaded, last.ETA)
 
 			if last.Status == StatusSeeding {
 				break loop
@@ -99,6 +101,15 @@ loop:
 	}
 	if last.Status != StatusSeeding {
 		t.Errorf("did not finish within the budget: %.2f%% (%s)", last.Progress, last.Status)
+	}
+
+	// Completion must leave the torrent seeding rather than torn down: the
+	// files stay open and a peer request can still be served.
+	if _, err := tor.Writer.ReadBlock(0, 0, 1024); err != nil {
+		t.Errorf("cannot serve a block after completion: %v", err)
+	}
+	if tor.ListenAddr() == nil {
+		t.Error("no listener while seeding")
 	}
 }
 

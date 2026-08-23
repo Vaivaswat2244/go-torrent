@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
@@ -204,5 +205,153 @@ func TestBitfield(t *testing.T) {
 			t.Errorf("HasPiece(%d) should be false", i)
 		}
 		bf.SetPiece(i)
+	}
+}
+
+// ReadBlock serves peer requests, so it must return sub-ranges correctly even
+// when a block straddles a file boundary.
+func TestReadBlock(t *testing.T) {
+	dir := t.TempDir()
+	tf := testTorrent() // piece length 16, files of 10/20/5
+	data := payload(tf.Length)
+
+	mw, err := NewMultiFileWriter(dir, tf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mw.Close()
+
+	for i, start := 0, 0; start < len(data); i, start = i+1, start+tf.PieceLength {
+		end := start + tf.PieceLength
+		if end > len(data) {
+			end = len(data)
+		}
+		if err := mw.WritePiece(i, data[start:end]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct{ piece, begin, length int }{
+		{0, 0, 4},  // start of piece 0, inside file 0
+		{0, 8, 8},  // straddles file 0 -> file 1
+		{0, 10, 6}, // entirely in file 1, offset into the piece
+		{1, 0, 16}, // whole of piece 1, straddles file 1 -> file 2
+		{1, 12, 4}, // tail of piece 1, inside file 2
+		{2, 0, 3},  // the short final piece
+		{2, 1, 2},  // offset within the short final piece
+	}
+
+	for _, c := range cases {
+		got, err := mw.ReadBlock(c.piece, c.begin, c.length)
+		if err != nil {
+			t.Errorf("ReadBlock(%d,%d,%d): %v", c.piece, c.begin, c.length, err)
+			continue
+		}
+		offset := c.piece*tf.PieceLength + c.begin
+		want := data[offset : offset+c.length]
+		if !bytes.Equal(got, want) {
+			t.Errorf("ReadBlock(%d,%d,%d) = %v, want %v", c.piece, c.begin, c.length, got, want)
+		}
+	}
+
+	// Reading past the end of the torrent must error, not return short data.
+	if _, err := mw.ReadBlock(2, 0, 16); err == nil {
+		t.Error("ReadBlock past the end of the torrent should fail")
+	}
+	for _, bad := range [][3]int{{-1, 0, 4}, {0, -1, 4}, {0, 0, 0}} {
+		if _, err := mw.ReadBlock(bad[0], bad[1], bad[2]); err == nil {
+			t.Errorf("ReadBlock%v should be rejected", bad)
+		}
+	}
+}
+
+// TestMultiFileWriterConcurrent is the analogue of TestSafeBitfieldConcurrent:
+// it reproduces the access pattern seeding introduces, where uploader goroutines
+// read blocks while the download loop writes pieces.
+//
+// Run with -race. On the old Seek-then-Read/Write implementation the shared
+// per-file cursor made readers and writers interleave, silently returning the
+// wrong bytes.
+func TestMultiFileWriterConcurrent(t *testing.T) {
+	dir := t.TempDir()
+
+	// Wide enough that many pieces are in flight at once.
+	tf := &torrentfile.TorrentFile{
+		Name:        "concurrent",
+		PieceLength: 64,
+		Length:      64 * 32,
+		IsMultiFile: true,
+		Files: []torrentfile.FileInfo{
+			{Length: 700, Path: []string{"a.bin"}},
+			{Length: 900, Path: []string{"sub", "b.bin"}},
+			{Length: 448, Path: []string{"c.bin"}},
+		},
+	}
+	data := payload(tf.Length)
+
+	mw, err := NewMultiFileWriter(dir, tf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mw.Close()
+
+	numPieces := tf.Length / tf.PieceLength
+
+	// Pre-write the first half so readers have verified content to check.
+	for i := 0; i < numPieces/2; i++ {
+		if err := mw.WritePiece(i, data[i*tf.PieceLength:(i+1)*tf.PieceLength]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+
+	// Writers: the download loop storing the second half.
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(offset int) {
+			defer wg.Done()
+			for i := numPieces/2 + offset; i < numPieces; i += 4 {
+				if err := mw.WritePiece(i, data[i*tf.PieceLength:(i+1)*tf.PieceLength]); err != nil {
+					t.Errorf("WritePiece(%d): %v", i, err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	// Readers: uploaders serving 16-byte blocks out of the settled first half.
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			for n := 0; n < 150; n++ {
+				piece := (seed*7 + n) % (numPieces / 2)
+				begin := (n % 4) * 16
+				got, err := mw.ReadBlock(piece, begin, 16)
+				if err != nil {
+					t.Errorf("ReadBlock(%d,%d,16): %v", piece, begin, err)
+					return
+				}
+				offset := piece*tf.PieceLength + begin
+				if !bytes.Equal(got, data[offset:offset+16]) {
+					t.Errorf("ReadBlock(%d,%d,16) returned the wrong bytes", piece, begin)
+					return
+				}
+			}
+		}(r)
+	}
+
+	wg.Wait()
+
+	// Everything must read back intact afterwards.
+	for i := 0; i < numPieces; i++ {
+		got, err := mw.ReadPiece(i, tf.PieceLength)
+		if err != nil {
+			t.Fatalf("ReadPiece(%d): %v", i, err)
+		}
+		if !bytes.Equal(got, data[i*tf.PieceLength:(i+1)*tf.PieceLength]) {
+			t.Fatalf("piece %d is corrupt after concurrent access", i)
+		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"math/rand"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,7 +22,7 @@ const (
 	StatusVerifying   Status = "Verifying"
 	StatusDownloading Status = "Downloading"
 	StatusStalled     Status = "Stalled"
-	StatusSeeding     Status = "Complete"
+	StatusSeeding     Status = "Seeding"
 	StatusError       Status = "Error"
 	StatusStopped     Status = "Stopped"
 )
@@ -35,24 +36,41 @@ const (
 	// advertising a tiny interval can't turn us into a hammer.
 	minAnnounceInterval = 5 * time.Minute
 
-	// speedWindow is the period the reported rate is averaged over.
-	speedWindow = 15 * time.Second
+	// rateWindow is the period transfer rates are averaged over.
+	rateWindow = 15 * time.Second
+
+	// DefaultMaxPeers caps concurrent connections per torrent. Real clients sit
+	// in this range; connecting to every peer a tracker returns wastes sockets
+	// and goroutines for no throughput gain.
+	DefaultMaxPeers = 50
 )
 
+// Limits are the optional stop conditions for seeding. Zero means unlimited.
+type Limits struct {
+	MaxPeers  int
+	SeedRatio float64
+	SeedTime  time.Duration
+}
+
 type TorrentStats struct {
-	Name        string
-	Progress    float64
-	SpeedBps    float64
-	Status      Status
-	PeersActive int
-	Downloaded  int64
-	Total       int64
-	ETA         time.Duration
+	Name          string
+	Progress      float64
+	SpeedBps      float64
+	UploadBps     float64
+	Status        Status
+	PeersActive   int
+	PeersUnchoked int
+	Downloaded    int64
+	Uploaded      int64
+	Ratio         float64
+	Total         int64
+	ETA           time.Duration
 }
 
 type sample struct {
-	at    time.Time
-	bytes int64
+	at   time.Time
+	down int64
+	up   int64
 }
 
 type Torrent struct {
@@ -60,23 +78,38 @@ type Torrent struct {
 	Writer *p2p.MultiFileWriter
 
 	bitfield *p2p.SafeBitfield
+	swarm    *swarm
+	maxPeers int
+	limits   Limits
+
+	workQueue chan *p2p.PieceWork
+	results   chan *p2p.PieceResult
+	peerChan  chan torrentfile.Peer
 
 	mu          sync.RWMutex
 	status      Status
 	piecesDone  int
 	totalPieces int
-	activePeers int
 	downloaded  int64
-	verified    int // pieces scanned so far, for the verifying screen
+	verified    int
 	lastPieceAt time.Time
 	samples     []sample
 	errText     string
+	listener    net.Listener
+
+	// sessions tracks live peer sessions so shutdown can wait for them before
+	// closing the files they read from.
+	sessions sync.WaitGroup
 
 	events chan string
 
-	// completed distinguishes "finished downloading" from "user quit" when the
-	// context is cancelled, so trackers get the right final event.
-	completed atomic.Bool
+	// completed marks the download finished. It is deliberately separate from
+	// the context: finishing a download is a state transition into seeding,
+	// not a shutdown.
+	completed    atomic.Bool
+	completedAt  atomic.Int64
+	downloadDone chan struct{}
+	completeOnce sync.Once
 
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -84,22 +117,39 @@ type Torrent struct {
 }
 
 func NewTorrent(tf *torrentfile.TorrentFile, outDir string) (*Torrent, error) {
+	return NewTorrentWithLimits(tf, outDir, Limits{})
+}
+
+func NewTorrentWithLimits(tf *torrentfile.TorrentFile, outDir string, limits Limits) (*Torrent, error) {
 	writer, err := p2p.NewMultiFileWriter(outDir, tf)
 	if err != nil {
 		return nil, err
 	}
 
+	maxPeers := limits.MaxPeers
+	if maxPeers <= 0 {
+		maxPeers = DefaultMaxPeers
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
+	totalPieces := len(tf.PieceHashes)
 
 	return &Torrent{
-		TF:          tf,
-		Writer:      writer,
-		status:      StatusStopped,
-		totalPieces: len(tf.PieceHashes),
-		bitfield:    p2p.NewSafeBitfield(len(tf.PieceHashes)),
-		events:      make(chan string, 256),
-		ctx:         ctx,
-		cancel:      cancel,
+		TF:           tf,
+		Writer:       writer,
+		status:       StatusStopped,
+		totalPieces:  totalPieces,
+		bitfield:     p2p.NewSafeBitfield(totalPieces),
+		swarm:        newSwarm(maxPeers),
+		maxPeers:     maxPeers,
+		limits:       limits,
+		workQueue:    make(chan *p2p.PieceWork, totalPieces),
+		results:      make(chan *p2p.PieceResult, 100),
+		peerChan:     make(chan torrentfile.Peer, 500),
+		events:       make(chan string, 256),
+		downloadDone: make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
 	}, nil
 }
 
@@ -129,6 +179,16 @@ func (t *Torrent) pieceLength(i int) int {
 		}
 	}
 	return t.TF.PieceLength
+}
+
+// AddPeer injects a peer address to connect to, bypassing tracker and DHT
+// discovery. Used by tests, and the natural entry point for PEX later.
+func (t *Torrent) AddPeer(p torrentfile.Peer) {
+	select {
+	case t.peerChan <- p:
+	case <-t.ctx.Done():
+	default:
+	}
 }
 
 // VerifyExistingState re-hashes whatever is already on disk so an interrupted
@@ -170,6 +230,8 @@ func (t *Torrent) VerifyExistingState() {
 }
 
 func (t *Torrent) GetStats() TorrentStats {
+	uploaded := t.swarm.uploaded()
+
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -184,30 +246,40 @@ func (t *Torrent) GetStats() TorrentStats {
 		progress = float64(t.piecesDone) / float64(t.totalPieces) * 100
 	}
 
-	// Rolling rate over the recent window rather than an average over the whole
-	// session, which barely moved once a download had been running a while.
-	speed := 0.0
+	// Rolling rates over the recent window rather than an average over the
+	// whole session, which barely moved once a torrent had been running a while.
+	var downRate, upRate float64
 	if len(t.samples) >= 2 {
 		first, last := t.samples[0], t.samples[len(t.samples)-1]
 		if elapsed := last.at.Sub(first.at).Seconds(); elapsed > 0 {
-			speed = float64(last.bytes-first.bytes) / elapsed
+			downRate = float64(last.down-first.down) / elapsed
+			upRate = float64(last.up-first.up) / elapsed
 		}
 	}
 
 	var eta time.Duration
-	if speed > 0 && t.downloaded < total {
-		eta = time.Duration(float64(total-t.downloaded)/speed) * time.Second
+	if downRate > 0 && t.downloaded < total {
+		eta = time.Duration(float64(total-t.downloaded)/downRate) * time.Second
+	}
+
+	ratio := 0.0
+	if t.downloaded > 0 {
+		ratio = float64(uploaded) / float64(t.downloaded)
 	}
 
 	return TorrentStats{
-		Name:        t.TF.Name,
-		Progress:    progress,
-		Status:      t.status,
-		PeersActive: t.activePeers,
-		SpeedBps:    speed,
-		Downloaded:  t.downloaded,
-		Total:       total,
-		ETA:         eta,
+		Name:          t.TF.Name,
+		Progress:      progress,
+		Status:        t.status,
+		PeersActive:   t.swarm.count(),
+		PeersUnchoked: t.swarm.unchokedCount(),
+		SpeedBps:      downRate,
+		UploadBps:     upRate,
+		Downloaded:    t.downloaded,
+		Uploaded:      uploaded,
+		Ratio:         ratio,
+		Total:         total,
+		ETA:           eta,
 	}
 }
 
@@ -220,10 +292,12 @@ func (t *Torrent) Err() string {
 
 func (t *Torrent) fail(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
+
 	t.mu.Lock()
 	t.status = StatusError
 	t.errText = msg
 	t.mu.Unlock()
+
 	t.logf("Error: %s", msg)
 	t.cancel()
 }
@@ -232,8 +306,6 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 	t.setStatus(StatusStarting)
 
 	go func() {
-		defer t.Writer.Close()
-
 		// Verification re-hashes every existing byte on disk. It used to run
 		// synchronously inside Start, which the TUI calls from its update loop,
 		// freezing the interface for the whole scan.
@@ -247,69 +319,204 @@ func (t *Torrent) Start(peerID [20]byte, port uint16) {
 		}
 
 		t.mu.Lock()
-		t.status = StatusDownloading
 		t.lastPieceAt = time.Now()
-		t.samples = []sample{{at: time.Now(), bytes: t.downloaded}}
+		t.samples = []sample{{at: time.Now(), down: t.downloaded}}
 		remaining := t.totalPieces - t.piecesDone
 		t.mu.Unlock()
 
+		// Everything the torrent needs runs regardless of whether we still have
+		// pieces to fetch: a complete torrent goes straight to seeding rather
+		// than returning immediately as it used to.
+		t.listen(peerID, port)
+		go t.announceLoop(peerID, port)
+		go t.managePeers(peerID)
+		go t.chokeLoop()
+		go t.sampleLoop()
+
 		if remaining == 0 {
-			t.setStatus(StatusSeeding)
 			t.logf("All pieces already present")
-			return
+			t.markComplete()
+		} else {
+			t.setStatus(StatusDownloading)
+			t.fillWorkQueue()
+
+			// DHT is only useful while we still need peers to download from.
+			go dht.FindPeers(t.ctx, t.TF.InfoHash, t.peerChan, t.logf)
+
+			t.collect()
 		}
 
-		peerChan := make(chan torrentfile.Peer, 500)
-		workQueue := make(chan *p2p.PieceWork, t.totalPieces)
-		results := make(chan *p2p.PieceResult, 100)
-
-		// Populate the work queue in random order. (Rarest-first would be
-		// better, but needs swarm-wide availability tracking.)
-		var missing []int
-		for i := 0; i < t.totalPieces; i++ {
-			if !t.bitfield.Has(i) {
-				missing = append(missing, i)
-			}
-		}
-		rand.Shuffle(len(missing), func(i, j int) {
-			missing[i], missing[j] = missing[j], missing[i]
-		})
-		for _, i := range missing {
-			workQueue <- &p2p.PieceWork{
-				Index:  i,
-				Hash:   t.TF.PieceHashes[i],
-				Length: t.pieceLength(i),
-			}
-		}
-
-		go t.announceLoop(peerID, port, peerChan)
-		go dht.FindPeers(t.ctx, t.TF.InfoHash, peerChan, t.logf)
-		go t.managePeers(peerID, peerChan, workQueue, results)
-
-		t.collect(results, workQueue)
+		t.seedUntilDone()
 	}()
+}
+
+// fillWorkQueue enqueues the pieces we still need, in random order. (Rarest
+// first would be better, but needs swarm-wide availability tracking.)
+func (t *Torrent) fillWorkQueue() {
+	var missing []int
+	for i := 0; i < t.totalPieces; i++ {
+		if !t.bitfield.Has(i) {
+			missing = append(missing, i)
+		}
+	}
+
+	rand.Shuffle(len(missing), func(i, j int) {
+		missing[i], missing[j] = missing[j], missing[i]
+	})
+
+	for _, i := range missing {
+		t.workQueue <- &p2p.PieceWork{
+			Index:  i,
+			Hash:   t.TF.PieceHashes[i],
+			Length: t.pieceLength(i),
+		}
+	}
+}
+
+// markComplete transitions the torrent from downloading to seeding.
+func (t *Torrent) markComplete() {
+	t.completeOnce.Do(func() {
+		t.completed.Store(true)
+		t.completedAt.Store(time.Now().UnixNano())
+		t.setStatus(StatusSeeding)
+		close(t.downloadDone)
+	})
+}
+
+// seedUntilDone blocks while the torrent seeds, enforcing the stop conditions.
+// It returns when the torrent is stopped, at which point the files are closed.
+func (t *Torrent) seedUntilDone() {
+	defer t.shutdown()
+
+	t.mu.RLock()
+	status := t.status
+	t.mu.RUnlock()
+	if status == StatusError || status == StatusStopped {
+		return
+	}
+
+	if t.limits.SeedRatio <= 0 && t.limits.SeedTime <= 0 {
+		<-t.ctx.Done()
+		t.setStatus(StatusStopped)
+		return
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			t.setStatus(StatusStopped)
+			return
+
+		case <-ticker.C:
+			stats := t.GetStats()
+
+			if t.limits.SeedRatio > 0 && stats.Ratio >= t.limits.SeedRatio {
+				t.logf("Seed ratio %.2f reached, stopping", stats.Ratio)
+				t.stopSeeding()
+				return
+			}
+
+			if t.limits.SeedTime > 0 {
+				since := time.Since(time.Unix(0, t.completedAt.Load()))
+				if since >= t.limits.SeedTime {
+					t.logf("Seeded for %s, stopping", t.limits.SeedTime)
+					t.stopSeeding()
+					return
+				}
+			}
+		}
+	}
+}
+
+// stopSeeding ends seeding because a limit was reached. Returning straight out
+// of the loop skips the ctx.Done branch, so the status has to be set here.
+func (t *Torrent) stopSeeding() {
+	t.setStatus(StatusStopped)
+	t.Stop()
+}
+
+// shutdown waits for peer sessions to finish, then closes the files. Closing
+// used to be a defer in Start, so it fired the moment the download finished and
+// made seeding impossible.
+func (t *Torrent) shutdown() {
+	t.cancel()
+	t.swarm.closeAll()
+	t.sessions.Wait()
+	t.Writer.Close()
+}
+
+// sampleLoop keeps the rolling transfer-rate window fed even when no pieces are
+// landing, which is the normal case while seeding.
+func (t *Torrent) sampleLoop() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+			t.recordSample()
+		}
+	}
+}
+
+func (t *Torrent) recordSample() {
+	uploaded := t.swarm.uploaded()
+	now := time.Now()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.samples = append(t.samples, sample{at: now, down: t.downloaded, up: uploaded})
+
+	cutoff := now.Add(-rateWindow)
+	for len(t.samples) > 2 && t.samples[0].at.Before(cutoff) {
+		t.samples = t.samples[1:]
+	}
+}
+
+// chokeLoop runs the choke algorithm.
+func (t *Torrent) chokeLoop() {
+	ticker := time.NewTicker(chokeInterval * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+			t.swarm.chokeRound(t.completed.Load())
+		case <-t.swarm.nudge:
+			t.swarm.chokeRound(t.completed.Load())
+		}
+	}
 }
 
 // announceLoop announces to every tracker, then re-announces at the interval the
 // trackers ask for. Previously each tracker was contacted exactly once, so on a
 // long download the peer supply went stale and never recovered.
-func (t *Torrent) announceLoop(peerID [20]byte, port uint16, peerChan chan<- torrentfile.Peer) {
+func (t *Torrent) announceLoop(peerID [20]byte, port uint16) {
 	event := torrentfile.EventStarted
 
 	for {
-		interval := t.announceRound(peerID, port, peerChan, event)
+		interval := t.announceRound(peerID, port, event)
 		event = torrentfile.EventNone
 
 		select {
 		case <-t.ctx.Done():
 			// Best-effort final announce so trackers record the outcome and
 			// drop us promptly.
-			final := torrentfile.EventStopped
-			if t.completed.Load() {
-				final = torrentfile.EventCompleted
-			}
-			t.announceRound(peerID, port, nil, final)
+			t.announceRound(peerID, port, torrentfile.EventStopped)
 			return
+
+		case <-t.downloadDone:
+			// Completion is announced once, then we carry on seeding.
+			t.announceRound(peerID, port, torrentfile.EventCompleted)
+
 		case <-time.After(interval):
 		}
 	}
@@ -320,7 +527,6 @@ func (t *Torrent) announceLoop(peerID [20]byte, port uint16, peerChan chan<- tor
 func (t *Torrent) announceRound(
 	peerID [20]byte,
 	port uint16,
-	peerChan chan<- torrentfile.Peer,
 	event torrentfile.AnnounceEvent,
 ) time.Duration {
 	trackers := t.TF.Trackers
@@ -329,15 +535,17 @@ func (t *Torrent) announceRound(
 	}
 
 	t.mu.RLock()
+	downloaded := t.downloaded
+	t.mu.RUnlock()
+
 	req := torrentfile.AnnounceReq{
 		PeerID:     peerID,
 		Port:       port,
-		Downloaded: t.downloaded,
-		Uploaded:   0, // no upload path yet
-		Left:       int64(t.TF.Length) - t.downloaded,
+		Downloaded: downloaded,
+		Uploaded:   t.swarm.uploaded(),
+		Left:       int64(t.TF.Length) - downloaded,
 		Event:      event,
 	}
-	t.mu.RUnlock()
 	if req.Left < 0 {
 		req.Left = 0
 	}
@@ -372,11 +580,8 @@ func (t *Torrent) announceRound(
 			}
 
 			for _, p := range resp.Peers {
-				if peerChan == nil {
-					break
-				}
 				select {
-				case peerChan <- p:
+				case t.peerChan <- p:
 				case <-t.ctx.Done():
 					return
 				default:
@@ -393,13 +598,8 @@ func (t *Torrent) announceRound(
 	return next
 }
 
-// managePeers dials each distinct peer we hear about and runs a worker against it.
-func (t *Torrent) managePeers(
-	peerID [20]byte,
-	peerChan <-chan torrentfile.Peer,
-	workQueue chan *p2p.PieceWork,
-	results chan *p2p.PieceResult,
-) {
+// managePeers dials each distinct peer we hear about, up to the peer limit.
+func (t *Torrent) managePeers(peerID [20]byte) {
 	seen := make(map[string]bool)
 
 	for {
@@ -407,7 +607,7 @@ func (t *Torrent) managePeers(
 		select {
 		case <-t.ctx.Done():
 			return
-		case p, ok := <-peerChan:
+		case p, ok := <-t.peerChan:
 			if !ok {
 				return
 			}
@@ -415,45 +615,45 @@ func (t *Torrent) managePeers(
 		}
 
 		addr := peer.String()
-		if seen[addr] {
+		if seen[addr] || t.swarm.has(addr) {
 			continue
 		}
 		seen[addr] = true
 
-		go func(p torrentfile.Peer) {
-			t.mu.Lock()
-			t.activePeers++
-			t.mu.Unlock()
-			defer func() {
-				t.mu.Lock()
-				t.activePeers--
-				t.mu.Unlock()
-			}()
+		if t.swarm.count() >= t.maxPeers {
+			continue
+		}
 
-			for i := 0; i < 3; i++ {
-				p2p.Worker(t.ctx, p, t.TF, peerID, t.bitfield, workQueue, results)
-
-				select {
-				case <-t.ctx.Done():
-					return
-				default:
-				}
-				if len(workQueue) == 0 {
-					return
-				}
-
-				select {
-				case <-t.ctx.Done():
-					return
-				case <-time.After(time.Duration(i+1) * 2 * time.Second):
-				}
-			}
-		}(peer)
+		go t.dialPeer(peer, peerID)
 	}
 }
 
-// collect writes completed pieces and watches for stalls.
-func (t *Torrent) collect(results chan *p2p.PieceResult, workQueue chan *p2p.PieceWork) {
+func (t *Torrent) dialPeer(peer torrentfile.Peer, peerID [20]byte) {
+	session, err := p2p.Dial(
+		t.ctx, peer, t.TF, peerID, t.bitfield, t.Writer,
+		t.workQueue, t.results, t.logf,
+	)
+	if err != nil {
+		return
+	}
+
+	session.SetOnInterest(t.swarm.requestChokeRound)
+
+	if !t.swarm.add(session) {
+		session.Close()
+		return
+	}
+	defer t.swarm.remove(session)
+
+	t.sessions.Add(1)
+	defer t.sessions.Done()
+
+	session.Run()
+}
+
+// collect writes completed pieces and watches for stalls. It returns when the
+// download is finished or the torrent is stopped.
+func (t *Torrent) collect() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
@@ -480,7 +680,7 @@ func (t *Torrent) collect(results chan *p2p.PieceResult, workQueue chan *p2p.Pie
 			}
 			t.mu.Unlock()
 
-		case res := <-results:
+		case res := <-t.results:
 			if err := t.Writer.WritePiece(res.Index, res.Buf); err != nil {
 				// A dropped write used to be silent, so the piece was lost and
 				// the download sat at 99% forever.
@@ -497,23 +697,16 @@ func (t *Torrent) collect(results chan *p2p.PieceResult, workQueue chan *p2p.Pie
 			if t.status == StatusStalled {
 				t.status = StatusDownloading
 			}
-			t.samples = append(t.samples, sample{at: t.lastPieceAt, bytes: t.downloaded})
-			cutoff := t.lastPieceAt.Add(-speedWindow)
-			for len(t.samples) > 2 && t.samples[0].at.Before(cutoff) {
-				t.samples = t.samples[1:]
-			}
 			t.mu.Unlock()
+
+			// Let every connected peer know, so they can ask us for it.
+			t.swarm.broadcastHave(res.Index)
+			t.recordSample()
 		}
 	}
 
-	t.completed.Store(true)
-	t.setStatus(StatusSeeding)
 	t.logf("Download complete: %s", t.TF.Name)
-
-	// The work queue is deliberately never closed: workers may still be holding
-	// a piece to re-queue, and a send on a closed channel would panic at the
-	// exact moment the download succeeded. Cancelling stops them instead.
-	t.cancel()
+	t.markComplete()
 }
 
 // Stop halts the torrent. Safe to call more than once; it used to close a

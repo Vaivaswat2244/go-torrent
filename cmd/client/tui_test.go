@@ -5,6 +5,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/Vaivaswat2244/go-torrent/internal/engine"
 )
 
 // keyMsg builds the bubbletea key message for a key name.
@@ -39,7 +41,7 @@ func isQuit(t *testing.T, cmd tea.Cmd) bool {
 func TestQuitKeysOnDownloadScreen(t *testing.T) {
 	for _, key := range []string{"q", "esc", "ctrl+c"} {
 		t.Run(key, func(t *testing.T) {
-			m := initialModel([20]byte{}, t.TempDir())
+			m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Limits{})
 			m.screen = screenDownload
 
 			_, cmd := m.Update(keyMsg(key))
@@ -51,7 +53,7 @@ func TestQuitKeysOnDownloadScreen(t *testing.T) {
 }
 
 func TestMenuNavigation(t *testing.T) {
-	m := initialModel([20]byte{}, t.TempDir())
+	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Limits{})
 
 	next, _ := m.Update(keyMsg("down"))
 	m = next.(model)
