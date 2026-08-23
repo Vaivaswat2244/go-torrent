@@ -22,6 +22,13 @@ const (
 	MsgExtended      MessageID = 20
 )
 
+// MaxMessageSize caps how large a single peer message may claim to be. The
+// length prefix is peer-supplied, so without a ceiling a hostile peer can make
+// us allocate up to 4 GiB with one 4-byte header. The largest legitimate
+// message is a bitfield (one bit per piece; ~50 KB even for a 100 GB torrent)
+// or a piece block (16 KB), so 1 MiB is generous.
+const MaxMessageSize = 1 << 20
+
 // Message represents a peer wire protocol message
 type Message struct {
 	ID      MessageID
@@ -58,6 +65,10 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	// Keep-alive message (length = 0)
 	if length == 0 {
 		return nil, nil
+	}
+
+	if length > MaxMessageSize {
+		return nil, fmt.Errorf("peer announced an oversized message: %d bytes (max %d)", length, MaxMessageSize)
 	}
 
 	// Read message ID + payload

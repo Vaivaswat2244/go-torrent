@@ -9,7 +9,11 @@ import (
 )
 
 const MaxBlockSize = 16384 // 16 KB - standard block size
-const MaxBacklog = 100     // Max pipelined requests
+
+// MaxBacklog is how many block requests we keep in flight per peer. This was
+// 100 (1.6 MB outstanding), which many peers treat as abusive and drop; 5 is
+// the conventional figure and is enough to keep the pipe full.
+const MaxBacklog = 5
 
 // PieceWork represents a work item: download this piece
 type PieceWork struct {
@@ -76,7 +80,10 @@ func (pw *PieceWork) Download(client *peers.Client) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			client.Bitfield = append(client.Bitfield, byte(index))
+			// This used to append the index as a raw byte, which grew the
+			// bitfield with garbage that made HasPiece report pieces the peer
+			// did not have. Set the bit instead.
+			Bitfield(client.Bitfield).SetPiece(index)
 
 		case peers.MsgPiece:
 			n, err := peers.ParsePiece(pw.Index, buf, msg)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -30,18 +31,30 @@ const (
 	screenError
 )
 
+// maxLogLines is how much of the engine's event stream we keep on screen.
+const maxLogLines = 6
+
 type tickMsg time.Time
 type metadataReadyMsg struct{ tf *torrentfile.TorrentFile }
 type errMsg struct{ err error }
-type peerUpdateMsg struct {
-	peers   []string
-	seeders []string
-}
+type logMsg string
 
 func tick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+// waitForLog blocks on the engine's event channel so progress messages reach
+// the UI instead of being printed over the alt-screen.
+func waitForLog(t *engine.Torrent) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-t.Events()
+		if !ok {
+			return nil
+		}
+		return logMsg(msg)
+	}
 }
 
 type model struct {
@@ -53,10 +66,10 @@ type model struct {
 	torrent   *engine.Torrent
 	progress  progress.Model
 	stats     engine.TorrentStats
+	logs      []string
 
-	// peer tracking
-	connectedPeers   []string
-	connectedSeeders []string
+	// fetchCancel aborts an in-flight magnet metadata fetch.
+	fetchCancel context.CancelFunc
 
 	peerID    [20]byte
 	outputDir string
@@ -83,18 +96,23 @@ func initialModel(peerID [20]byte, outputDir string) model {
 	}
 }
 
-func (m model) Init() tea.Cmd {
-	return nil
+func (m model) Init() tea.Cmd { return nil }
+
+// quit shuts down any running work before exiting.
+func (m model) quit() (tea.Model, tea.Cmd) {
+	if m.torrent != nil {
+		m.torrent.Stop()
+	}
+	if m.fetchCancel != nil {
+		m.fetchCancel()
+	}
+	return m, tea.Quit
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	// Global handlers
 	if key, ok := msg.(tea.KeyMsg); ok {
 		if key.String() == "ctrl+c" {
-			if m.torrent != nil {
-				m.torrent.Stop()
-			}
-			return m, tea.Quit
+			return m.quit()
 		}
 	}
 	if ws, ok := msg.(tea.WindowSizeMsg); ok {
@@ -115,7 +133,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case screenDone, screenError:
 		if key, ok := msg.(tea.KeyMsg); ok {
 			if key.String() == "q" || key.String() == "enter" {
-				return m, tea.Quit
+				return m.quit()
 			}
 		}
 	}
@@ -146,7 +164,7 @@ func (m model) updateMenu(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textInput.Focus()
 			return m, textinput.Blink
 		case "q":
-			return m, tea.Quit
+			return m.quit()
 		}
 	}
 	return m, nil
@@ -165,10 +183,14 @@ func (m model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.screen = screenFetching
+
 			if m.inputMode == 0 {
-				return m, m.loadTorrentFile(val)
+				return m, loadTorrentFile(val)
 			}
-			return m, m.fetchMagnetMetadata(val)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			m.fetchCancel = cancel
+			return m, fetchMagnetMetadata(ctx, val, m.peerID)
 		}
 	}
 
@@ -179,6 +201,16 @@ func (m model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) updateFetching(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		// A DHT metadata fetch can take a minute; let the user back out.
+		if msg.String() == "esc" || msg.String() == "q" {
+			if m.fetchCancel != nil {
+				m.fetchCancel()
+				m.fetchCancel = nil
+			}
+			m.screen = screenMenu
+			return m, nil
+		}
 	case metadataReadyMsg:
 		return m.startDownload(msg.tf)
 	case errMsg:
@@ -191,12 +223,35 @@ func (m model) updateFetching(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) updateDownload(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		// The help line advertised "q to quit" but nothing handled key presses
+		// on this screen, so only ctrl+c worked.
+		switch msg.String() {
+		case "q", "esc":
+			return m.quit()
+		}
+		return m, nil
+
+	case logMsg:
+		m.logs = append(m.logs, string(msg))
+		if len(m.logs) > maxLogLines {
+			m.logs = m.logs[len(m.logs)-maxLogLines:]
+		}
+		return m, waitForLog(m.torrent)
+
 	case tickMsg:
 		m.stats = m.torrent.GetStats()
-		if m.stats.Status == engine.StatusSeeding {
+
+		switch m.stats.Status {
+		case engine.StatusSeeding:
 			m.screen = screenDone
 			return m, nil
+		case engine.StatusError:
+			m.screen = screenError
+			m.errText = m.torrent.Err()
+			return m, nil
 		}
+
 		cmd := m.progress.SetPercent(m.stats.Progress / 100.0)
 		return m, tea.Batch(tick(), cmd)
 
@@ -215,7 +270,7 @@ func (m model) updateDownload(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
-func (m model) loadTorrentFile(path string) tea.Cmd {
+func loadTorrentFile(path string) tea.Cmd {
 	return func() tea.Msg {
 		tf, err := torrentfile.Open(path)
 		if err != nil {
@@ -225,8 +280,7 @@ func (m model) loadTorrentFile(path string) tea.Cmd {
 	}
 }
 
-func (m model) fetchMagnetMetadata(uri string) tea.Cmd {
-	peerID := m.peerID
+func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte) tea.Cmd {
 	return func() tea.Msg {
 		mag, err := magnet.Parse(uri)
 		if err != nil {
@@ -234,26 +288,39 @@ func (m model) fetchMagnetMetadata(uri string) tea.Cmd {
 		}
 
 		peerChan := make(chan torrentfile.Peer, 100)
-		go dht.FindPeers(mag.InfoHash, peerChan)
+		go dht.FindPeers(ctx, mag.InfoHash, peerChan, nil)
 
 		tempTF := mag.ToTorrentFile()
-		for _, trackerURL := range mag.Trackers {
-			trackerURL := trackerURL
-			go func() {
-				peers, err := tempTF.RequestPeersUDP(trackerURL, peerID, 6881)
+		req := torrentfile.AnnounceReq{
+			PeerID: peerID,
+			Port:   listenPort,
+			Left:   -1, // real size is unknown until metadata arrives
+			Event:  torrentfile.EventStarted,
+		}
+		if req.Left < 0 {
+			req.Left = 0
+		}
+
+		for _, trackerURL := range torrentfile.FilterSupportedTrackers(mag.Trackers) {
+			go func(trackerURL string) {
+				// AnnounceTo dispatches on scheme, so http:// trackers in the
+				// magnet are actually usable.
+				resp, err := tempTF.AnnounceTo(trackerURL, req)
 				if err != nil {
 					return
 				}
-				for _, p := range peers {
+				for _, p := range resp.Peers {
 					select {
 					case peerChan <- p:
+					case <-ctx.Done():
+						return
 					default:
 					}
 				}
-			}()
+			}(trackerURL)
 		}
 
-		rawInfo, err := metadata.Fetch(mag.InfoHash, peerID, peerChan)
+		rawInfo, err := metadata.Fetch(ctx, mag.InfoHash, peerID, peerChan)
 		if err != nil {
 			return errMsg{fmt.Errorf("metadata fetch failed: %w", err)}
 		}
@@ -263,14 +330,22 @@ func (m model) fetchMagnetMetadata(uri string) tea.Cmd {
 			return errMsg{fmt.Errorf("failed to decode metadata: %w", err)}
 		}
 
-		infoDict := infoDictVal.(map[string]bencode.Value)
+		// Unchecked, this assertion panicked the whole program on a malformed
+		// metadata response.
+		infoDict, ok := infoDictVal.(map[string]bencode.Value)
+		if !ok {
+			return errMsg{fmt.Errorf("metadata is not a bencode dictionary")}
+		}
+
 		tf, err := torrentfile.ParseInfoDict(infoDict, mag.InfoHash)
 		if err != nil {
 			return errMsg{fmt.Errorf("failed to parse metadata: %w", err)}
 		}
 
-		tf.Name = mag.Name
-		tf.Trackers = mag.Trackers
+		// tf.Name is deliberately left as parsed. It used to be overwritten with
+		// the magnet's "dn" parameter, so a magnet without one produced a folder
+		// literally named Unknown_Magnet_Download.
+		tf.Trackers = torrentfile.FilterSupportedTrackers(mag.Trackers)
 		return metadataReadyMsg{tf}
 	}
 }
@@ -284,8 +359,8 @@ func (m model) startDownload(tf *torrentfile.TorrentFile) (tea.Model, tea.Cmd) {
 	}
 	m.torrent = t
 	m.screen = screenDownload
-	t.Start(m.peerID, 6881)
-	return m, tea.Batch(tick(), m.progress.SetPercent(0))
+	t.Start(m.peerID, listenPort)
+	return m, tea.Batch(tick(), waitForLog(t), m.progress.SetPercent(0))
 }
 
 // ── Views ─────────────────────────────────────────────────────────────────────
@@ -345,24 +420,30 @@ func (m model) viewFetching() string {
 	}
 	return titleStyle.Render("⚡ go-torrent") + "\n" +
 		boxStyle.Render(content) + "\n" +
-		helpStyle.Render("ctrl+c to quit")
+		helpStyle.Render("esc to cancel · ctrl+c to quit")
 }
 
 func (m model) viewDownload() string {
 	s := m.stats
-	sizeTotal := float64(m.torrent.TF.Length) / 1024 / 1024 / 1024
-	sizeDone := sizeTotal * (s.Progress / 100.0)
 
-	// ── Left panel: info + progress ───────────────────────────────────────
 	row := func(label, val string) string {
 		return labelStyle.Render(label) + valueStyle.Render(val)
+	}
+
+	sizeLine := fmt.Sprintf("%s / %s", humanBytes(s.Downloaded), humanBytes(s.Total))
+	speedLine := humanBytes(int64(s.SpeedBps)) + "/s"
+
+	etaLine := "--"
+	if s.ETA > 0 {
+		etaLine = formatDuration(s.ETA)
 	}
 
 	info := strings.Join([]string{
 		row("Status:  ", statusColor(s.Status).Render(string(s.Status))),
 		row("File:    ", truncate(s.Name, 38)),
-		row("Size:    ", fmt.Sprintf("%.2f / %.2f GB", sizeDone, sizeTotal)),
-		row("Speed:   ", fmt.Sprintf("%.2f MB/s", s.SpeedMBps)),
+		row("Size:    ", sizeLine),
+		row("Speed:   ", speedLine),
+		row("ETA:     ", etaLine),
 	}, "\n")
 
 	bar := "\n" + m.progress.View() + "\n" +
@@ -370,27 +451,26 @@ func (m model) viewDownload() string {
 
 	leftPanel := boxStyle.Render(info + "\n" + bar)
 
-	// ── Right panel: peers + seeders ──────────────────────────────────────
-	activePeers := s.PeersActive
-
-	// We split active peers evenly into peers/seeders for display
-	// (engine tracks total active; real seeder detection needs BEP work)
-	peerLines := fmt.Sprintf("%s\n",
-		valueStyle.Render(fmt.Sprintf("%d", activePeers)),
-	)
-	peerLines += dimStyle.Render("connected peers")
-
 	rightPanel := boxStyle.Render(
 		subtitleStyle.Bold(true).Render("🌐 Network") + "\n\n" +
-			peerLines,
+			valueStyle.Render(fmt.Sprintf("%d", s.PeersActive)) + "\n" +
+			dimStyle.Render("connected peers"),
 	)
 
-	// ── Join panels side by side ──────────────────────────────────────────
 	panels := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
 
-	return titleStyle.Render("⚡ go-torrent") + "\n" +
-		panels + "\n" +
-		helpStyle.Render("q to quit")
+	out := titleStyle.Render("⚡ go-torrent") + "\n" + panels
+
+	// Engine progress messages, which used to be printed straight to stdout.
+	if len(m.logs) > 0 {
+		var lines []string
+		for _, l := range m.logs {
+			lines = append(lines, dimStyle.Render("· "+truncate(l, 76)))
+		}
+		out += "\n" + boxStyle.Render(strings.Join(lines, "\n"))
+	}
+
+	return out + "\n" + helpStyle.Render("q to quit")
 }
 
 func (m model) viewDone() string {
@@ -451,18 +531,53 @@ func statusColor(s engine.Status) lipgloss.Style {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Bold(true)
 	case engine.StatusSeeding:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("82")).Bold(true)
-	case engine.StatusError:
+	case engine.StatusError, engine.StatusStalled:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 	default:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
 	}
 }
 
+// humanBytes scales to the right unit. Sizes were previously always printed in
+// GB, so anything under a gigabyte showed as "0.00 GB".
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit && exp < 4; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(n)/float64(div), "KMGTP"[exp])
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := int(d.Hours())
+	mnt := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+
+	if h > 0 {
+		return fmt.Sprintf("%dh %dm", h, mnt)
+	}
+	if mnt > 0 {
+		return fmt.Sprintf("%dm %ds", mnt, s)
+	}
+	return fmt.Sprintf("%ds", s)
+}
+
+// truncate trims by rune, so multi-byte names are not cut mid-character.
 func truncate(s string, max int) string {
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
-	return s[:max-3] + "..."
+	if max <= 3 {
+		return string(r[:max])
+	}
+	return string(r[:max-3]) + "..."
 }
 
 func runTUI(peerID [20]byte, outputDir string) {

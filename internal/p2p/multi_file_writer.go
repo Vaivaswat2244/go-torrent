@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
@@ -31,17 +32,29 @@ func NewMultiFileWriter(baseDir string, tf *torrentfile.TorrentFile) (*MultiFile
 
 	// If it's a multi-file torrent, the base folder is tf.Name
 	// If it's a single file, tf.Name is just the file name, so we don't append it to the base dir
-	isMultiFile := len(tf.Files) > 1
 	targetDir := baseDir
-	if isMultiFile {
+	if tf.IsMultiFile {
 		targetDir = filepath.Join(baseDir, tf.Name)
 	}
+
+	// Resolved once so every file can be checked against it below.
+	cleanTarget := filepath.Clean(targetDir)
+	prefix := cleanTarget + string(os.PathSeparator)
 
 	for _, f := range tf.Files {
 		// Build the full path (e.g., targetDir/subtitles/de.srt)
 		fullPath := targetDir
 		for _, p := range f.Path {
 			fullPath = filepath.Join(fullPath, p)
+		}
+
+		// Defence in depth. torrentfile rejects unsafe path components at parse
+		// time, but this writer opens files with O_CREATE, so it re-checks that
+		// the resolved path is still inside the download directory rather than
+		// trusting its caller.
+		fullPath = filepath.Clean(fullPath)
+		if fullPath != cleanTarget && !strings.HasPrefix(fullPath, prefix) {
+			return nil, fmt.Errorf("refusing to write %q: outside download directory %q", fullPath, cleanTarget)
 		}
 
 		// Create parent directories
@@ -188,6 +201,9 @@ func (mw *MultiFileWriter) ReadPiece(pieceIndex int, expectedLength int) ([]byte
 
 func (mw *MultiFileWriter) Close() {
 	for _, f := range mw.files {
+		// Flush before closing; pieces are written with plain Write calls, so
+		// without this a crash right after completion can lose recent pieces.
+		f.file.Sync()
 		f.file.Close()
 	}
 }

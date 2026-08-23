@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -17,19 +18,40 @@ var BootstrapNodes = []string{
 	"dht.aelitis.com:6881",
 }
 
-func FindPeers(infoHash [20]byte, peerChan chan<- torrentfile.Peer) {
+// LogFunc receives progress messages. The crawler used to fmt.Println straight
+// to stdout, which corrupts the TUI's alt-screen.
+type LogFunc func(format string, args ...interface{})
+
+// FindPeers crawls the DHT for peers holding infoHash, delivering them to
+// peerChan until ctx is cancelled.
+//
+// This is a flood crawler rather than a real Kademlia node: it queries every
+// node it hears about instead of converging on the closest ones, and it neither
+// announces itself nor answers incoming queries.
+func FindPeers(ctx context.Context, infoHash [20]byte, peerChan chan<- torrentfile.Peer, logf LogFunc) {
+	if logf == nil {
+		logf = func(string, ...interface{}) {}
+	}
+
 	nodeID := GenerateNodeID()
 
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
-		fmt.Println("DHT: Failed to open UDP socket")
+		logf("DHT: failed to open UDP socket: %v", err)
 		return
 	}
 	defer conn.Close()
 
+	// Previously the sender ranged over a channel nothing ever closed, so this
+	// function never returned: the socket and both goroutines leaked, and the
+	// crawl kept hammering the network for the life of the process.
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	nodeQueue := make(chan string, 5000)
 
-	// seenNodes is now protected by a mutex since it's shared across goroutines
 	var mu sync.Mutex
 	seenNodes := make(map[string]bool)
 
@@ -49,15 +71,26 @@ func FindPeers(infoHash [20]byte, peerChan chan<- torrentfile.Peer) {
 		addNode(addr)
 	}
 
-	fmt.Println("🌐 DHT Crawler starting...")
+	logf("DHT crawler starting")
 
 	// Reader goroutine
 	go func() {
 		buf := make([]byte, 2048)
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			n, _, err := conn.ReadFromUDP(buf)
 			if err != nil {
+				// A closed socket means we are shutting down; anything else is
+				// a timeout worth retrying.
+				if ctx.Err() != nil {
+					return
+				}
 				continue
 			}
 
@@ -84,22 +117,28 @@ func FindPeers(infoHash [20]byte, peerChan chan<- torrentfile.Peer) {
 			// Got peers directly
 			if values, ok := rDict["values"].([]bencode.Value); ok {
 				for _, v := range values {
-					if peerStr, ok := v.(string); ok {
-						peers, _ := parseCompactPeers([]byte(peerStr))
-						for _, p := range peers {
-							select {
-							case peerChan <- p:
-							default:
-							}
+					peerStr, ok := v.(string)
+					if !ok {
+						continue
+					}
+					peers, err := parseCompactPeers([]byte(peerStr))
+					if err != nil {
+						continue
+					}
+					for _, p := range peers {
+						select {
+						case peerChan <- p:
+						case <-ctx.Done():
+							return
+						default:
 						}
 					}
 				}
 			}
 
-			// Got closer nodes — queue them up
+			// Got closer nodes - queue them up
 			if nodesStr, err := bencode.GetString(rDict, "nodes"); err == nil {
-				nodes, err := ParseCompactNodes(nodesStr)
-				if err == nil {
+				if nodes, err := ParseCompactNodes(nodesStr); err == nil {
 					for _, n := range nodes {
 						addNode(n.String())
 					}
@@ -110,13 +149,19 @@ func FindPeers(infoHash [20]byte, peerChan chan<- torrentfile.Peer) {
 
 	// Sender loop: re-encode with a fresh transaction ID per node
 	// so DHT nodes don't discard duplicate t values
-	for addr := range nodeQueue {
+	for {
+		var addr string
+		select {
+		case <-ctx.Done():
+			return
+		case addr = <-nodeQueue:
+		}
+
 		udpAddr, err := net.ResolveUDPAddr("udp", addr)
 		if err != nil {
 			continue
 		}
 
-		// Fresh query per node (new transaction ID each time)
 		queryMap := FormatGetPeers(nodeID, infoHash)
 		queryBytes, err := bencode.Encode(queryMap)
 		if err != nil {
@@ -125,9 +170,12 @@ func FindPeers(infoHash [20]byte, peerChan chan<- torrentfile.Peer) {
 
 		conn.WriteToUDP(queryBytes, udpAddr)
 
-		// 5ms throttle — fast enough to saturate the queue, slow enough
-		// that response goroutine can refill nodeQueue before we drain it
-		time.Sleep(5 * time.Millisecond)
+		// Throttle so we don't drain the queue faster than replies refill it.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 
@@ -142,7 +190,9 @@ func parseCompactPeers(buf []byte) ([]torrentfile.Peer, error) {
 
 	for i := 0; i < numPeers; i++ {
 		offset := i * peerSize
-		peers[i].IP = net.IP(buf[offset : offset+4])
+		ip := make(net.IP, 4)
+		copy(ip, buf[offset:offset+4])
+		peers[i].IP = ip
 		peers[i].Port = uint16(buf[offset+4])<<8 | uint16(buf[offset+5])
 	}
 

@@ -2,13 +2,15 @@ package torrentfile
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/anacrolix/torrent/bencode"
+	"github.com/Vaivaswat2244/go-torrent/internal/bencode"
 )
 
 // Peer represents a single peer
@@ -17,103 +19,91 @@ type Peer struct {
 	Port uint16
 }
 
-// TrackerResponse represents the tracker's response
-type bencodeTrackerResp struct {
-	Interval int    `bencode:"interval"`
-	Peers    string `bencode:"peers"`
+// AnnounceEvent is the BEP 3 / BEP 15 event code sent with an announce.
+type AnnounceEvent uint32
+
+const (
+	EventNone      AnnounceEvent = 0
+	EventCompleted AnnounceEvent = 1
+	EventStarted   AnnounceEvent = 2
+	EventStopped   AnnounceEvent = 3
+)
+
+func (e AnnounceEvent) String() string {
+	switch e {
+	case EventCompleted:
+		return "completed"
+	case EventStarted:
+		return "started"
+	case EventStopped:
+		return "stopped"
+	default:
+		return ""
+	}
 }
 
-// RequestPeers contacts the tracker (HTTP or UDP) and returns a list of peers
-// It tries the main announce URL first, then falls back to announce-list
-func (tf *TorrentFile) RequestPeers(peerID [20]byte, port uint16) ([]Peer, error) {
-	// Build list of all trackers to try
-	var trackers []string
-
-	// Add primary announce if present
-	if tf.Announce != "" {
-		trackers = append(trackers, tf.Announce)
-	}
-
-	// Add announce-list trackers
-	for _, tier := range tf.AnnounceList {
-		trackers = append(trackers, tier...)
-	}
-
-	// Add public trackers as fallback
-	publicTrackers := []string{
-		"http://tracker.opentrackr.org:1337/announce",
-		"udp://tracker.opentrackr.org:1337/announce",
-		"udp://open.demonii.com:1337/announce",
-		"udp://tracker.openbittorrent.com:6969/announce",
-	}
-	trackers = append(trackers, publicTrackers...)
-
-	if len(trackers) == 0 {
-		return nil, fmt.Errorf("no trackers found in torrent file")
-	}
-
-	// Try each tracker (limit attempts to avoid infinite waiting)
-	maxTries := 10 // Only try first 10 trackers
-	if len(trackers) < maxTries {
-		maxTries = len(trackers)
-	}
-
-	var lastErr error
-	for i := 0; i < maxTries; i++ {
-		tracker := trackers[i]
-		if tracker == "" {
-			continue
-		}
-
-		// Truncate long tracker URLs for display
-		displayTracker := tracker
-		if len(displayTracker) > 60 {
-			displayTracker = displayTracker[:57] + "..."
-		}
-		fmt.Printf("  [%d/%d] Trying %s\n", i+1, maxTries, displayTracker)
-
-		peers, err := tf.tryTracker(tracker, peerID, port)
-		if err == nil && len(peers) > 0 {
-			fmt.Printf("  ✅ Success! Got %d peers\n", len(peers))
-			return peers, nil
-		}
-		if err != nil {
-			// Show shortened error message
-			errMsg := err.Error()
-			if len(errMsg) > 80 {
-				errMsg = errMsg[:77] + "..."
-			}
-			fmt.Printf("  ❌ Failed: %s\n", errMsg)
-			lastErr = err
-		} else {
-			fmt.Printf("  ⚠️  No peers returned\n")
-		}
-	}
-
-	if lastErr != nil {
-		return nil, fmt.Errorf("all trackers failed, last error: %w", lastErr)
-	}
-	return nil, fmt.Errorf("all trackers failed")
+// AnnounceReq is the swarm state reported to a tracker. These numbers used to be
+// hardcoded (downloaded/uploaded always 0, left always the full torrent length),
+// which misreports progress to every tracker, resume included.
+type AnnounceReq struct {
+	PeerID     [20]byte
+	Port       uint16
+	Downloaded int64
+	Uploaded   int64
+	Left       int64
+	Event      AnnounceEvent
 }
 
-// tryTracker attempts to contact a single tracker
-func (tf *TorrentFile) tryTracker(trackerURL string, peerID [20]byte, port uint16) ([]Peer, error) {
-	// Check if tracker is HTTP/HTTPS or UDP
-	if len(trackerURL) >= 6 && trackerURL[:6] == "udp://" {
-		return tf.RequestPeersUDP(trackerURL, peerID, port)
-	}
-	if len(trackerURL) >= 7 && trackerURL[:7] == "http://" {
-		return tf.RequestPeersHTTP(trackerURL, peerID, port)
-	}
-	if len(trackerURL) >= 8 && trackerURL[:8] == "https://" {
-		return tf.RequestPeersHTTP(trackerURL, peerID, port)
-	}
-	return nil, fmt.Errorf("unsupported tracker protocol: %s", trackerURL)
+// AnnounceResp is a tracker's reply. Interval matters: without honouring it the
+// client announces once and never again, so the peer supply goes stale.
+type AnnounceResp struct {
+	Peers    []Peer
+	Interval time.Duration
+	Seeders  int
+	Leechers int
 }
 
-// RequestPeersHTTP contacts an HTTP tracker and returns a list of peers
-func (tf *TorrentFile) RequestPeersHTTP(trackerURL string, peerID [20]byte, port uint16) ([]Peer, error) {
-	// Build tracker URL with query parameters
+// SupportedTracker reports whether we can speak this tracker's protocol.
+// Torrents commonly list WebTorrent (ws://, wss://) trackers, which are only
+// reachable from a browser; announcing to them just produces error noise every
+// round.
+func SupportedTracker(trackerURL string) bool {
+	return strings.HasPrefix(trackerURL, "udp://") ||
+		strings.HasPrefix(trackerURL, "http://") ||
+		strings.HasPrefix(trackerURL, "https://")
+}
+
+// FilterSupportedTrackers drops tracker URLs whose protocol we cannot use.
+func FilterSupportedTrackers(urls []string) []string {
+	var out []string
+	for _, u := range urls {
+		if SupportedTracker(u) {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// maxTrackerResponse bounds how much we read from an HTTP tracker.
+const maxTrackerResponse = 1 << 20
+
+// AnnounceTo contacts a single tracker, dispatching on the URL scheme.
+//
+// The engine previously called RequestPeersUDP directly for every tracker in
+// the announce-list, including http:// ones, so every HTTP tracker burned a UDP
+// timeout and returned nothing.
+func (tf *TorrentFile) AnnounceTo(trackerURL string, req AnnounceReq) (*AnnounceResp, error) {
+	switch {
+	case strings.HasPrefix(trackerURL, "udp://"):
+		return tf.announceUDP(trackerURL, req)
+	case strings.HasPrefix(trackerURL, "http://"), strings.HasPrefix(trackerURL, "https://"):
+		return tf.announceHTTP(trackerURL, req)
+	default:
+		return nil, fmt.Errorf("unsupported tracker protocol: %s", trackerURL)
+	}
+}
+
+func (tf *TorrentFile) announceHTTP(trackerURL string, r AnnounceReq) (*AnnounceResp, error) {
 	u, err := url.Parse(trackerURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tracker URL: %w", err)
@@ -121,57 +111,118 @@ func (tf *TorrentFile) RequestPeersHTTP(trackerURL string, peerID [20]byte, port
 
 	params := url.Values{
 		"info_hash":  []string{string(tf.InfoHash[:])},
-		"peer_id":    []string{string(peerID[:])},
-		"port":       []string{strconv.Itoa(int(port))},
-		"uploaded":   []string{"0"},
-		"downloaded": []string{"0"},
+		"peer_id":    []string{string(r.PeerID[:])},
+		"port":       []string{strconv.Itoa(int(r.Port))},
+		"uploaded":   []string{strconv.FormatInt(r.Uploaded, 10)},
+		"downloaded": []string{strconv.FormatInt(r.Downloaded, 10)},
+		"left":       []string{strconv.FormatInt(r.Left, 10)},
 		"compact":    []string{"1"},
-		"left":       []string{strconv.Itoa(tf.Length)},
+	}
+	if ev := r.Event.String(); ev != "" {
+		params.Set("event", ev)
 	}
 	u.RawQuery = params.Encode()
 
-	// Make HTTP GET request to tracker
 	timeout := 5 * time.Second
-	if len(trackerURL) >= 8 && trackerURL[:8] == "https://" {
+	if u.Scheme == "https" {
 		timeout = 10 * time.Second // HTTPS needs more time for SSL handshake
 	}
 	client := &http.Client{Timeout: timeout}
 
-	// Create request with proper headers
-	req, err := http.NewRequest("GET", u.String(), nil)
+	httpReq, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	req.Header.Set("User-Agent", "go-torrent/0.1")
+	httpReq.Header.Set("User-Agent", "go-torrent/0.1")
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("tracker request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Check status code
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("tracker returned status %d", resp.StatusCode)
 	}
 
-	// Parse bencode response
-	var trackerResp bencodeTrackerResp
-	err = bencode.NewDecoder(resp.Body).Decode(&trackerResp)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTrackerResponse))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tracker response: %w", err)
+	}
+
+	// DecodeWithLength rather than Decode: some trackers append a trailing
+	// newline, which a whole-input decode would reject.
+	val, _, err := bencode.DecodeWithLength(body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse tracker response: %w", err)
 	}
+	dict, ok := val.(map[string]bencode.Value)
+	if !ok {
+		return nil, fmt.Errorf("tracker response is not a dictionary")
+	}
 
-	// Parse compact peer list (6 bytes per peer: 4 for IP, 2 for port)
-	allPeers, err := parsePeers([]byte(trackerResp.Peers))
+	// A refusal is a well-formed response, not a parse error. Reporting it as
+	// one hid the actual reason (bad info hash, unregistered torrent, ...).
+	if reason, err := bencode.GetString(dict, "failure reason"); err == nil {
+		return nil, fmt.Errorf("tracker refused: %s", reason)
+	}
+
+	out := &AnnounceResp{}
+	if n, err := bencode.GetInt(dict, "interval"); err == nil {
+		out.Interval = time.Duration(n) * time.Second
+	}
+	if n, err := bencode.GetInt(dict, "complete"); err == nil {
+		out.Seeders = int(n)
+	}
+	if n, err := bencode.GetInt(dict, "incomplete"); err == nil {
+		out.Leechers = int(n)
+	}
+
+	peers, err := parsePeerField(dict["peers"])
 	if err != nil {
 		return nil, err
 	}
+	out.Peers = filterSelfPeer(peers, r.Port)
 
-	// Filter out our own IP/port
-	peers := filterSelfPeer(allPeers, port)
+	return out, nil
+}
 
-	return peers, nil
+// parsePeerField handles both the compact form (a byte string, 6 bytes per peer)
+// and the original dictionary form some trackers still return.
+func parsePeerField(val bencode.Value) ([]Peer, error) {
+	switch v := val.(type) {
+	case nil:
+		return nil, nil
+
+	case string:
+		return parsePeers([]byte(v))
+
+	case []bencode.Value:
+		var peers []Peer
+		for _, entry := range v {
+			d, ok := entry.(map[string]bencode.Value)
+			if !ok {
+				continue
+			}
+			ipStr, err := bencode.GetString(d, "ip")
+			if err != nil {
+				continue
+			}
+			port, err := bencode.GetInt(d, "port")
+			if err != nil || port <= 0 || port > 65535 {
+				continue
+			}
+			ip := net.ParseIP(ipStr)
+			if ip == nil {
+				continue
+			}
+			peers = append(peers, Peer{IP: ip, Port: uint16(port)})
+		}
+		return peers, nil
+
+	default:
+		return nil, fmt.Errorf("unexpected peers field type %T", val)
+	}
 }
 
 // parsePeers converts compact peer format to Peer structs
@@ -186,7 +237,10 @@ func parsePeers(peersBin []byte) ([]Peer, error) {
 	peers := make([]Peer, numPeers)
 	for i := 0; i < numPeers; i++ {
 		offset := i * peerSize
-		peers[i].IP = net.IP(peersBin[offset : offset+4])
+		// Copy rather than alias: peersBin may be a reused read buffer.
+		ip := make(net.IP, 4)
+		copy(ip, peersBin[offset:offset+4])
+		peers[i].IP = ip
 		peers[i].Port = uint16(peersBin[offset+4])<<8 | uint16(peersBin[offset+5])
 	}
 
@@ -202,20 +256,16 @@ func (p Peer) String() string {
 func filterSelfPeer(peers []Peer, ourPort uint16) []Peer {
 	var filtered []Peer
 
-	// Get our public IP addresses
 	ourIPs := getOurIPs()
 
 	for _, peer := range peers {
 		isSelf := false
-
-		// Check if this peer matches our IP and port
 		for _, ourIP := range ourIPs {
 			if peer.IP.Equal(ourIP) && peer.Port == ourPort {
 				isSelf = true
 				break
 			}
 		}
-
 		if !isSelf {
 			filtered = append(filtered, peer)
 		}
@@ -228,15 +278,12 @@ func filterSelfPeer(peers []Peer, ourPort uint16) []Peer {
 func getOurIPs() []net.IP {
 	var ips []net.IP
 
-	// Get our local IP
-	localIP := getOutboundIP()
-	if localIP != nil {
+	// Note: we can't easily get our public IP without an external service. The
+	// tracker usually avoids sending us our own IP; filtering by port covers
+	// the rest.
+	if localIP := getOutboundIP(); localIP != nil {
 		ips = append(ips, localIP)
 	}
-
-	// Note: We can't easily get our public IP without external service
-	// The tracker will handle this by not sending us our own IP in most cases
-	// But if we do get it, filtering by port should be enough
 
 	return ips
 }
