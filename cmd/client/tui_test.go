@@ -1,12 +1,15 @@
 package main
 
 import (
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Vaivaswat2244/go-torrent/internal/engine"
+	"github.com/Vaivaswat2244/go-torrent/internal/magnet"
 )
 
 // keyMsg builds the bubbletea key message for a key name.
@@ -166,5 +169,100 @@ func TestGeneratePeerIDIsUnique(t *testing.T) {
 			t.Errorf("peer ID contains a non-printable byte: %v", a)
 			break
 		}
+	}
+}
+
+// longMagnet builds a magnet of the shape public indexers hand out: an info
+// hash, a display name, and a long tail of trackers.
+func longMagnet() (uri string, trackers []string) {
+	trackers = []string{
+		"udp://tracker.opentrackr.org:1337/announce",
+		"udp://open.demonii.com:1337/announce",
+		"udp://open.stealth.si:80/announce",
+		"udp://tracker.torrent.eu.org:451/announce",
+		"udp://exodus.desync.com:6969/announce",
+		"udp://tracker.moeking.me:6969/announce",
+		"udp://explodie.org:6969/announce",
+		"udp://tracker.dler.org:6969/announce",
+		"udp://opentracker.i2p.rocks:6969/announce",
+		"udp://tracker1.bt.moack.co.kr:80/announce",
+		"udp://tracker.theoks.net:6969/announce",
+		"udp://tracker.bittor.pw:1337/announce",
+		"https://tracker.tamersunion.org:443/announce",
+		"udp://tracker-udp.gbitt.info:80/announce",
+		"http://tracker.openbittorrent.com:80/announce",
+	}
+
+	uri = "magnet:?xt=urn:btih:88594aaacbde40ef3e2510c47374ec0aa396c08e" +
+		"&dn=" + url.QueryEscape("ubuntu-24.04.1-desktop-amd64.iso")
+	for _, tr := range trackers {
+		uri += "&tr=" + url.QueryEscape(tr)
+	}
+	return uri, trackers
+}
+
+// The magnet input used to cap at 512 characters, which silently cut the
+// tracker list off real magnet links. The info hash survives, since it sits at
+// the front, so the download still starts — it just quietly loses every tracker
+// past the cutoff and falls back to DHT alone.
+func TestLongMagnetLinkIsNotTruncated(t *testing.T) {
+	uri, trackers := longMagnet()
+
+	if len(uri) <= 512 {
+		t.Fatalf("test magnet is only %d chars; it must exceed the old 512 limit to be meaningful", len(uri))
+	}
+
+	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Limits{})
+
+	// Menu -> Magnet link -> input screen.
+	next, _ := m.Update(keyMsg("down"))
+	m = next.(model)
+	next, _ = m.Update(keyMsg("enter"))
+	m = next.(model)
+	if m.screen != screenInput || m.inputMode != 1 {
+		t.Fatalf("expected the magnet input screen, got screen=%v mode=%d", m.screen, m.inputMode)
+	}
+
+	// A paste arrives as one batch of runes.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(uri)})
+	m = next.(model)
+
+	got := m.textInput.Value()
+	if got != uri {
+		t.Fatalf("input was truncated: kept %d of %d characters", len(got), len(uri))
+	}
+
+	// What actually matters is that the trackers survive the round trip.
+	mag, err := magnet.Parse(got)
+	if err != nil {
+		t.Fatalf("parsing the pasted magnet: %v", err)
+	}
+	if len(mag.Trackers) != len(trackers) {
+		t.Errorf("kept %d of %d trackers", len(mag.Trackers), len(trackers))
+	}
+	for i, want := range trackers {
+		if i < len(mag.Trackers) && mag.Trackers[i] != want {
+			t.Errorf("tracker %d = %q, want %q", i, mag.Trackers[i], want)
+		}
+	}
+}
+
+// Long filesystem paths go through the same field.
+func TestLongPathIsNotTruncated(t *testing.T) {
+	path := "/home/user/" + strings.Repeat("a-fairly-long-directory-name/", 25) + "file.torrent"
+	if len(path) <= 512 {
+		t.Fatalf("test path is only %d chars", len(path))
+	}
+
+	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Limits{})
+
+	next, _ := m.Update(keyMsg("enter")) // torrent-file mode
+	m = next.(model)
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(path)})
+	m = next.(model)
+
+	if got := m.textInput.Value(); got != path {
+		t.Errorf("path truncated: kept %d of %d characters", len(got), len(path))
 	}
 }

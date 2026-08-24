@@ -81,7 +81,12 @@ type model struct {
 
 func initialModel(peerID [20]byte, outputDir string, port uint16, limits engine.Limits) model {
 	ti := textinput.New()
-	ti.CharLimit = 512
+	// No character limit. This was 512, which silently truncated real magnet
+	// links: once a magnet carries a dozen trackers it runs well past that, and
+	// because the info hash sits at the front the download still started — it
+	// just lost every tracker after the cutoff and quietly fell back to DHT
+	// alone. Long filesystem paths hit the same cap.
+	ti.CharLimit = 0
 	ti.Width = 60
 
 	p := progress.New(
