@@ -8,10 +8,15 @@ import (
 // Value represents any bencode value
 type Value interface{}
 
+// maxDepth bounds container nesting. Bencode reaching this decoder is untrusted
+// (DHT packets, peer-supplied metadata), and decodeValue recurses once per level,
+// so without a cap a payload of "lllll..." recurses until the stack is exhausted.
+// Real torrents nest a handful of levels.
+const maxDepth = 100
+
 // Decode parses bencoded data and returns the decoded value
 func Decode(data []byte) (Value, error) {
-	pos := 0
-	value, newPos, err := decodeValue(data, pos)
+	value, newPos, err := decodeValue(data, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -21,20 +26,25 @@ func Decode(data []byte) (Value, error) {
 	return value, nil
 }
 
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
 // decodeValue decodes a single bencode value starting at pos
-func decodeValue(data []byte, pos int) (Value, int, error) {
+func decodeValue(data []byte, pos int, depth int) (Value, int, error) {
+	if depth > maxDepth {
+		return nil, pos, fmt.Errorf("bencode nesting exceeds %d levels", maxDepth)
+	}
 	if pos >= len(data) {
 		return nil, pos, fmt.Errorf("unexpected end of data")
 	}
 
-	switch data[pos] {
-	case 'i':
+	switch {
+	case data[pos] == 'i':
 		return decodeInteger(data, pos)
-	case 'l':
-		return decodeList(data, pos)
-	case 'd':
-		return decodeDict(data, pos)
-	case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+	case data[pos] == 'l':
+		return decodeList(data, pos, depth)
+	case data[pos] == 'd':
+		return decodeDict(data, pos, depth)
+	case isDigit(data[pos]):
 		return decodeString(data, pos)
 	default:
 		return nil, pos, fmt.Errorf("invalid bencode value at position %d", pos)
@@ -57,6 +67,12 @@ func decodeString(data []byte, pos int) (string, int, error) {
 	length, err := strconv.Atoi(lengthStr)
 	if err != nil {
 		return "", pos, fmt.Errorf("invalid string length: %w", err)
+	}
+
+	// Atoi accepts "-5". A negative length makes end < start below, which the
+	// end > len(data) guard does not catch, and data[start:end] then panics.
+	if length < 0 {
+		return "", pos, fmt.Errorf("negative string length: %d", length)
 	}
 
 	// Extract string data
@@ -93,12 +109,12 @@ func decodeInteger(data []byte, pos int) (int64, int, error) {
 }
 
 // decodeList decodes a bencoded list: l<values>e
-func decodeList(data []byte, pos int) ([]Value, int, error) {
+func decodeList(data []byte, pos int, depth int) ([]Value, int, error) {
 	pos++ // Skip 'l'
 
 	list := []Value{}
 	for pos < len(data) && data[pos] != 'e' {
-		value, newPos, err := decodeValue(data, pos)
+		value, newPos, err := decodeValue(data, pos, depth+1)
 		if err != nil {
 			return nil, pos, err
 		}
@@ -114,12 +130,18 @@ func decodeList(data []byte, pos int) ([]Value, int, error) {
 }
 
 // decodeDict decodes a bencoded dictionary: d<key><value>...e
-func decodeDict(data []byte, pos int) (map[string]Value, int, error) {
+func decodeDict(data []byte, pos int, depth int) (map[string]Value, int, error) {
 	pos++ // Skip 'd'
 
 	dict := make(map[string]Value)
 	for pos < len(data) && data[pos] != 'e' {
-		// Decode key (must be a string)
+		// Keys must be bencoded strings, so they must start with a digit.
+		// decodeValue enforces this for values, but keys are decoded directly,
+		// so without this check a key like "-5:" reaches the length parser.
+		if !isDigit(data[pos]) {
+			return nil, pos, fmt.Errorf("invalid dict key at position %d: not a string", pos)
+		}
+
 		key, newPos, err := decodeString(data, pos)
 		if err != nil {
 			return nil, pos, fmt.Errorf("invalid dict key: %w", err)
@@ -127,7 +149,7 @@ func decodeDict(data []byte, pos int) (map[string]Value, int, error) {
 		pos = newPos
 
 		// Decode value
-		value, newPos, err := decodeValue(data, pos)
+		value, newPos, err := decodeValue(data, pos, depth+1)
 		if err != nil {
 			return nil, pos, fmt.Errorf("invalid dict value: %w", err)
 		}
@@ -186,7 +208,7 @@ func GetDict(dict map[string]Value, key string) (map[string]Value, error) {
 
 // DecodeWithLength parses bencoded data and also returns how many bytes were consumed
 func DecodeWithLength(data []byte) (Value, int, error) {
-	value, consumed, err := decodeValue(data, 0)
+	value, consumed, err := decodeValue(data, 0, 0)
 	if err != nil {
 		return nil, 0, err
 	}

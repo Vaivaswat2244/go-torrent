@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 )
 
 // MessageID represents the type of message
@@ -21,6 +22,13 @@ const (
 	MsgCancel        MessageID = 8
 	MsgExtended      MessageID = 20
 )
+
+// MaxMessageSize caps how large a single peer message may claim to be. The
+// length prefix is peer-supplied, so without a ceiling a hostile peer can make
+// us allocate up to 4 GiB with one 4-byte header. The largest legitimate
+// message is a bitfield (one bit per piece; ~50 KB even for a 100 GB torrent)
+// or a piece block (16 KB), so 1 MiB is generous.
+const MaxMessageSize = 1 << 20
 
 // Message represents a peer wire protocol message
 type Message struct {
@@ -58,6 +66,10 @@ func ReadMessage(r io.Reader) (*Message, error) {
 	// Keep-alive message (length = 0)
 	if length == 0 {
 		return nil, nil
+	}
+
+	if length > MaxMessageSize {
+		return nil, fmt.Errorf("peer announced an oversized message: %d bytes (max %d)", length, MaxMessageSize)
 	}
 
 	// Read message ID + payload
@@ -106,6 +118,72 @@ func FormatHave(index int) *Message {
 		ID:      MsgHave,
 		Payload: payload,
 	}
+}
+
+// FormatChoke creates a Choke message
+func FormatChoke() *Message {
+	return &Message{ID: MsgChoke}
+}
+
+// FormatUnchoke creates an Unchoke message
+func FormatUnchoke() *Message {
+	return &Message{ID: MsgUnchoke}
+}
+
+// FormatCancel creates a Cancel message, withdrawing an outstanding request.
+func FormatCancel(index, begin, length int) *Message {
+	payload := make([]byte, 12)
+	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
+	binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
+	binary.BigEndian.PutUint32(payload[8:12], uint32(length))
+
+	return &Message{ID: MsgCancel, Payload: payload}
+}
+
+// FormatPiece creates a Piece message carrying one block of data.
+func FormatPiece(index, begin int, data []byte) *Message {
+	payload := make([]byte, 8+len(data))
+	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
+	binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
+	copy(payload[8:], data)
+
+	return &Message{ID: MsgPiece, Payload: payload}
+}
+
+// BlockRequest is a peer asking us for one block.
+type BlockRequest struct {
+	Index  int
+	Begin  int
+	Length int
+}
+
+// ParseRequest parses a Request or Cancel message.
+//
+// This is peer-controlled input that decides what we read off disk, so the
+// caller must still validate the values against the torrent's geometry.
+func ParseRequest(msg *Message) (BlockRequest, error) {
+	var req BlockRequest
+
+	if msg.ID != MsgRequest && msg.ID != MsgCancel {
+		return req, fmt.Errorf("expected Request or Cancel, got ID %d", msg.ID)
+	}
+	if len(msg.Payload) != 12 {
+		return req, fmt.Errorf("expected payload length 12, got %d", len(msg.Payload))
+	}
+
+	index := binary.BigEndian.Uint32(msg.Payload[0:4])
+	begin := binary.BigEndian.Uint32(msg.Payload[4:8])
+	length := binary.BigEndian.Uint32(msg.Payload[8:12])
+
+	// Guard the conversion to int before anyone does arithmetic on these.
+	if index > math.MaxInt32 || begin > math.MaxInt32 || length > math.MaxInt32 {
+		return req, fmt.Errorf("request field out of range: index=%d begin=%d length=%d", index, begin, length)
+	}
+
+	req.Index = int(index)
+	req.Begin = int(begin)
+	req.Length = int(length)
+	return req, nil
 }
 
 // ParsePiece parses a Piece message

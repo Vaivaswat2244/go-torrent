@@ -1,7 +1,7 @@
 package metadata
 
 import (
-	"bytes"
+	"context"
 	"crypto/sha1"
 	"fmt"
 	"net"
@@ -12,28 +12,51 @@ import (
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
 
-// Fetch coordinates the downloading of the .torrent metadata from peers
-func Fetch(infoHash [20]byte, peerID [20]byte, peerChan <-chan torrentfile.Peer) ([]byte, error) {
+// maxMetadataSize caps the metadata_size a peer may advertise. numPieces is
+// derived from it and drives an append loop, so an unbounded value lets a single
+// peer drive us out of memory. Real info dictionaries are well under this.
+const maxMetadataSize = 16 << 20 // 16 MiB
 
-	resultChan := make(chan []byte)
+// Fetch coordinates the downloading of the .torrent metadata from peers
+func Fetch(ctx context.Context, infoHash [20]byte, peerID [20]byte, peerChan <-chan torrentfile.Peer) ([]byte, error) {
+	// Buffered so a verified result is never dropped. Previously this was
+	// unbuffered with a "default:" send, so if the receiver was not parked at
+	// that exact instant the metadata was thrown away and the worker exited.
+	resultChan := make(chan []byte, 1)
+
+	// Cancelled when Fetch returns, so the workers stop dialing peers instead
+	// of leaking for the lifetime of the process.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := ctx.Done()
 
 	// Launch 10 concurrent workers to try peers simultaneously
 	for i := 0; i < 10; i++ {
 		go func() {
-			for peer := range peerChan {
-				infoBytes, err := tryFetchFromPeer(peer, infoHash, peerID)
-				if err == nil {
-					// Verify the downloaded metadata matches our magnet link
-					hash := sha1.Sum(infoBytes)
-					if bytes.Equal(hash[:], infoHash[:]) {
-						select {
-						case resultChan <- infoBytes:
-						default:
-						}
+			for {
+				select {
+				case <-done:
+					return
+				case peer, ok := <-peerChan:
+					if !ok {
 						return
-					} else {
-						fmt.Printf("  [%s] hash mismatch — got %x\n", peer, hash)
 					}
+
+					infoBytes, err := tryFetchFromPeer(peer, infoHash, peerID)
+					if err != nil {
+						continue
+					}
+
+					// Verify the downloaded metadata matches our magnet link
+					if sha1.Sum(infoBytes) != infoHash {
+						continue
+					}
+
+					select {
+					case resultChan <- infoBytes:
+					default:
+					}
+					return
 				}
 			}
 		}()
@@ -42,8 +65,9 @@ func Fetch(infoHash [20]byte, peerID [20]byte, peerChan <-chan torrentfile.Peer)
 	// Wait for the FIRST successful result, or timeout after 60 seconds
 	select {
 	case infoBytes := <-resultChan:
-		fmt.Println("\n✅ Metadata downloaded and verified successfully!")
 		return infoBytes, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("metadata fetch cancelled")
 	case <-time.After(60 * time.Second):
 		return nil, fmt.Errorf("timed out: could not find any active peers with this metadata")
 	}
@@ -114,8 +138,17 @@ func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte,
 		}
 	}
 
-	if metadataSize == 0 || theirMetadataID == 0 {
-		return nil, err
+	// Previously "return nil, err" here, where err is nil on the normal break
+	// path -- so a peer without ut_metadata produced (nil, nil), and the caller
+	// treated that as success and SHA-1'd a nil slice.
+	if theirMetadataID == 0 {
+		return nil, fmt.Errorf("peer does not support ut_metadata")
+	}
+	if metadataSize <= 0 {
+		return nil, fmt.Errorf("peer advertised metadata_size %d", metadataSize)
+	}
+	if metadataSize > maxMetadataSize {
+		return nil, fmt.Errorf("peer advertised metadata_size %d, over the %d limit", metadataSize, maxMetadataSize)
 	}
 
 	// 4. Request Metadata Pieces (BEP 9)

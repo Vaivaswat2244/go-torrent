@@ -2,9 +2,9 @@ package p2p
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
@@ -16,6 +16,12 @@ type fileEntry struct {
 	globalOffset int64 // Where this file starts in the grand scheme of the torrent
 }
 
+// MultiFileWriter presents a torrent's files as one flat byte array.
+//
+// It is safe for concurrent use: all I/O goes through ReadAt/WriteAt, which are
+// positional and hold no per-file cursor. The previous Seek-then-Read/Write
+// pairs shared a cursor across callers, so a reader and a writer touching the
+// same file would interleave and return the wrong bytes.
 type MultiFileWriter struct {
 	files       []fileEntry
 	pieceLength int
@@ -31,17 +37,29 @@ func NewMultiFileWriter(baseDir string, tf *torrentfile.TorrentFile) (*MultiFile
 
 	// If it's a multi-file torrent, the base folder is tf.Name
 	// If it's a single file, tf.Name is just the file name, so we don't append it to the base dir
-	isMultiFile := len(tf.Files) > 1
 	targetDir := baseDir
-	if isMultiFile {
+	if tf.IsMultiFile {
 		targetDir = filepath.Join(baseDir, tf.Name)
 	}
+
+	// Resolved once so every file can be checked against it below.
+	cleanTarget := filepath.Clean(targetDir)
+	prefix := cleanTarget + string(os.PathSeparator)
 
 	for _, f := range tf.Files {
 		// Build the full path (e.g., targetDir/subtitles/de.srt)
 		fullPath := targetDir
 		for _, p := range f.Path {
 			fullPath = filepath.Join(fullPath, p)
+		}
+
+		// Defence in depth. torrentfile rejects unsafe path components at parse
+		// time, but this writer opens files with O_CREATE, so it re-checks that
+		// the resolved path is still inside the download directory rather than
+		// trusting its caller.
+		fullPath = filepath.Clean(fullPath)
+		if fullPath != cleanTarget && !strings.HasPrefix(fullPath, prefix) {
+			return nil, fmt.Errorf("refusing to write %q: outside download directory %q", fullPath, cleanTarget)
 		}
 
 		// Create parent directories
@@ -77,117 +95,138 @@ func NewMultiFileWriter(baseDir string, tf *torrentfile.TorrentFile) (*MultiFile
 	}, nil
 }
 
-// WritePiece slices the piece data and distributes it to the correct files
-func (mw *MultiFileWriter) WritePiece(pieceIndex int, data []byte) error {
-	pieceStart := int64(pieceIndex) * int64(mw.pieceLength)
-	pieceEnd := pieceStart + int64(len(data))
-
-	dataOffset := 0 // Tracks how much of the piece we've written so far
-
-	for _, f := range mw.files {
-		fileStart := f.globalOffset
-		fileEnd := f.globalOffset + f.length
-
-		// If this file ends before our piece starts, skip it
-		if fileEnd <= pieceStart {
-			continue
-		}
-
-		// If this file starts after our piece ends, we are completely done
-		if fileStart >= pieceEnd {
-			break
-		}
-
-		// There is an overlap! Calculate exactly where to write and how much.
-		localSeekPos := int64(0)
-		if pieceStart > fileStart {
-			localSeekPos = pieceStart - fileStart
-		}
-
-		// Calculate how many bytes we can write to this file
-		bytesToWrite := int64(len(data) - dataOffset)
-		if localSeekPos+bytesToWrite > f.length {
-			bytesToWrite = f.length - localSeekPos
-		}
-
-		// Seek and Write
-		_, err := f.file.Seek(localSeekPos, 0)
-		if err != nil {
-			return fmt.Errorf("seek failed: %w", err)
-		}
-
-		chunkToWrite := data[dataOffset : dataOffset+int(bytesToWrite)]
-		_, err = f.file.Write(chunkToWrite)
-		if err != nil {
-			return fmt.Errorf("write failed: %w", err)
-		}
-
-		// Update our data offset for the next file (if the piece spans boundaries)
-		dataOffset += int(bytesToWrite)
-		pieceStart += bytesToWrite
-
-		if dataOffset >= len(data) {
-			break // Entire piece written
-		}
+// forEachFileRange maps the global byte range [globalOffset, globalOffset+len(p))
+// onto the files it spans, calling fn once per file with that file's local
+// offset and the corresponding slice of p.
+//
+// A torrent is one flat byte array split across files, and a piece can straddle
+// a file boundary, so both reads and writes need this mapping. It used to be
+// duplicated between WritePiece and ReadPiece.
+func (mw *MultiFileWriter) forEachFileRange(
+	globalOffset int64,
+	p []byte,
+	fn func(f fileEntry, localOffset int64, chunk []byte) error,
+) error {
+	if globalOffset < 0 {
+		return fmt.Errorf("negative offset %d", globalOffset)
 	}
 
-	return nil
-}
-
-func (mw *MultiFileWriter) ReadPiece(pieceIndex int, expectedLength int) ([]byte, error) {
-	data := make([]byte, expectedLength)
-	pieceStart := int64(pieceIndex) * int64(mw.pieceLength)
-	pieceEnd := pieceStart + int64(expectedLength)
-
+	end := globalOffset + int64(len(p))
+	cur := globalOffset
 	dataOffset := 0
 
 	for _, f := range mw.files {
 		fileStart := f.globalOffset
 		fileEnd := f.globalOffset + f.length
 
-		// Skip files that don't overlap with this piece
-		if fileEnd <= pieceStart {
+		// This file ends before our range starts.
+		if fileEnd <= cur {
 			continue
 		}
-		if fileStart >= pieceEnd {
+		// This file starts after our range ends; the rest cannot overlap.
+		if fileStart >= end {
 			break
 		}
 
-		localSeekPos := int64(0)
-		if pieceStart > fileStart {
-			localSeekPos = pieceStart - fileStart
+		localOffset := int64(0)
+		if cur > fileStart {
+			localOffset = cur - fileStart
 		}
 
-		bytesToRead := int64(expectedLength - dataOffset)
-		if localSeekPos+bytesToRead > f.length {
-			bytesToRead = f.length - localSeekPos
+		n := int64(len(p) - dataOffset)
+		if localOffset+n > f.length {
+			n = f.length - localOffset
+		}
+		if n <= 0 {
+			continue
 		}
 
-		_, err := f.file.Seek(localSeekPos, 0)
-		if err != nil {
-			return nil, err
+		if err := fn(f, localOffset, p[dataOffset:dataOffset+int(n)]); err != nil {
+			return err
 		}
 
-		// Use io.ReadFull to guarantee we read exactly what we need
-		chunkToRead := data[dataOffset : dataOffset+int(bytesToRead)]
-		_, err = io.ReadFull(f.file, chunkToRead)
-		if err != nil {
-			return nil, err
-		} // File might not be fully written yet, that's fine
+		dataOffset += int(n)
+		cur += n
 
-		dataOffset += int(bytesToRead)
-		pieceStart += bytesToRead
-
-		if dataOffset >= expectedLength {
+		if dataOffset >= len(p) {
 			break
 		}
 	}
 
+	// Falling short means the caller asked for bytes past the end of the
+	// torrent. Previously this returned short data with no error.
+	if dataOffset < len(p) {
+		return fmt.Errorf("range [%d,%d) extends past the end of the torrent", globalOffset, end)
+	}
+	return nil
+}
+
+// writeAt writes p at a global byte offset.
+func (mw *MultiFileWriter) writeAt(globalOffset int64, p []byte) error {
+	return mw.forEachFileRange(globalOffset, p, func(f fileEntry, localOffset int64, chunk []byte) error {
+		if _, err := f.file.WriteAt(chunk, localOffset); err != nil {
+			return fmt.Errorf("write failed: %w", err)
+		}
+		return nil
+	})
+}
+
+// readAt fills p from a global byte offset.
+func (mw *MultiFileWriter) readAt(globalOffset int64, p []byte) error {
+	return mw.forEachFileRange(globalOffset, p, func(f fileEntry, localOffset int64, chunk []byte) error {
+		// ReadAt reads len(chunk) bytes or returns an error, so it gives the
+		// same guarantee io.ReadFull used to.
+		if _, err := f.file.ReadAt(chunk, localOffset); err != nil {
+			return fmt.Errorf("read failed: %w", err)
+		}
+		return nil
+	})
+}
+
+// WritePiece stores a complete piece, distributing it across files as needed.
+func (mw *MultiFileWriter) WritePiece(pieceIndex int, data []byte) error {
+	if pieceIndex < 0 {
+		return fmt.Errorf("negative piece index %d", pieceIndex)
+	}
+	return mw.writeAt(int64(pieceIndex)*int64(mw.pieceLength), data)
+}
+
+// ReadPiece reads a whole piece back, used by resume verification.
+func (mw *MultiFileWriter) ReadPiece(pieceIndex int, expectedLength int) ([]byte, error) {
+	if pieceIndex < 0 || expectedLength <= 0 {
+		return nil, fmt.Errorf("invalid piece read: index %d length %d", pieceIndex, expectedLength)
+	}
+
+	data := make([]byte, expectedLength)
+	if err := mw.readAt(int64(pieceIndex)*int64(mw.pieceLength), data); err != nil {
+		return nil, err
+	}
 	return data, nil
+}
+
+// ReadBlock reads a sub-range of a piece, which is what serving a peer request
+// needs: blocks are 16 KB while a piece may be megabytes.
+//
+// Callers must validate the request against the torrent's geometry first; this
+// only guards against reading outside the torrent itself.
+func (mw *MultiFileWriter) ReadBlock(pieceIndex, begin, length int) ([]byte, error) {
+	if pieceIndex < 0 || begin < 0 || length <= 0 {
+		return nil, fmt.Errorf("invalid block read: piece %d begin %d length %d", pieceIndex, begin, length)
+	}
+
+	buf := make([]byte, length)
+	offset := int64(pieceIndex)*int64(mw.pieceLength) + int64(begin)
+	if err := mw.readAt(offset, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 func (mw *MultiFileWriter) Close() {
 	for _, f := range mw.files {
+		// Flush before closing; pieces are written with plain Write calls, so
+		// without this a crash right after completion can lose recent pieces.
+		f.file.Sync()
 		f.file.Close()
 	}
 }
