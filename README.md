@@ -29,6 +29,10 @@ connections to you unless you forward the port yourself:
 Without a forwarded port you will still upload on connections you initiate,
 just to fewer peers.
 
+## Release notes
+
+See [RELEASE_NOTES.md](RELEASE_NOTES.md) for what changed in each release.
+
 ## Install
 
 Build from source:
