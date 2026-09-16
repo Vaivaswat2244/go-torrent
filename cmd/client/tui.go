@@ -17,6 +17,7 @@ import (
 	"github.com/Vaivaswat2244/go-torrent/internal/engine"
 	"github.com/Vaivaswat2244/go-torrent/internal/magnet"
 	"github.com/Vaivaswat2244/go-torrent/internal/metadata"
+	"github.com/Vaivaswat2244/go-torrent/internal/mse"
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
 
@@ -74,12 +75,12 @@ type model struct {
 	peerID    [20]byte
 	outputDir string
 	port      uint16
-	limits    engine.Limits
+	opts      engine.Options
 	errText   string
 	width     int
 }
 
-func initialModel(peerID [20]byte, outputDir string, port uint16, limits engine.Limits) model {
+func initialModel(peerID [20]byte, outputDir string, port uint16, opts engine.Options) model {
 	ti := textinput.New()
 	// No character limit. This was 512, which silently truncated real magnet
 	// links: once a magnet carries a dozen trackers it runs well past that, and
@@ -101,7 +102,7 @@ func initialModel(peerID [20]byte, outputDir string, port uint16, limits engine.
 		peerID:    peerID,
 		outputDir: outputDir,
 		port:      port,
-		limits:    limits,
+		opts:      opts,
 	}
 }
 
@@ -199,7 +200,7 @@ func (m model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			m.fetchCancel = cancel
-			return m, fetchMagnetMetadata(ctx, val, m.peerID, m.port)
+			return m, fetchMagnetMetadata(ctx, val, m.peerID, m.port, m.opts.Encryption)
 		}
 	}
 
@@ -296,7 +297,7 @@ func loadTorrentFile(path string) tea.Cmd {
 	}
 }
 
-func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte, port uint16) tea.Cmd {
+func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte, port uint16, encryption mse.Policy) tea.Cmd {
 	return func() tea.Msg {
 		mag, err := magnet.Parse(uri)
 		if err != nil {
@@ -336,7 +337,7 @@ func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte, port 
 			}(trackerURL)
 		}
 
-		rawInfo, err := metadata.Fetch(ctx, mag.InfoHash, peerID, peerChan)
+		rawInfo, err := metadata.Fetch(ctx, mag.InfoHash, peerID, peerChan, encryption)
 		if err != nil {
 			return errMsg{fmt.Errorf("metadata fetch failed: %w", err)}
 		}
@@ -367,7 +368,7 @@ func fetchMagnetMetadata(ctx context.Context, uri string, peerID [20]byte, port 
 }
 
 func (m model) startDownload(tf *torrentfile.TorrentFile) (tea.Model, tea.Cmd) {
-	t, err := engine.NewTorrentWithLimits(tf, m.outputDir, m.limits)
+	t, err := engine.NewTorrentWithOptions(tf, m.outputDir, m.opts)
 	if err != nil {
 		m.screen = screenError
 		m.errText = err.Error()
@@ -617,8 +618,8 @@ func truncate(s string, max int) string {
 	return string(r[:max-3]) + "..."
 }
 
-func runTUI(peerID [20]byte, outputDir string, port uint16, limits engine.Limits) {
-	m := initialModel(peerID, outputDir, port, limits)
+func runTUI(peerID [20]byte, outputDir string, port uint16, opts engine.Options) {
+	m := initialModel(peerID, outputDir, port, opts)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatalf("TUI error: %v", err)

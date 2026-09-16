@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"net"
 	"sync/atomic"
 	"time"
 
+	"github.com/Vaivaswat2244/go-torrent/internal/mse"
 	"github.com/Vaivaswat2244/go-torrent/internal/peers"
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
@@ -598,16 +598,10 @@ func Dial(
 	workQueue chan *PieceWork,
 	results chan *PieceResult,
 	logf LogFunc,
+	encryption mse.Policy,
 ) (*Session, error) {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", peer.String())
+	client, err := peers.Connect(ctx, peer.String(), tf.InfoHash, peerID, encryption)
 	if err != nil {
-		return nil, err
-	}
-
-	client, err := peers.CompleteHandshake(conn, tf.InfoHash, peerID)
-	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 

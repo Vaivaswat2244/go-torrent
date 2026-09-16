@@ -7,6 +7,7 @@ import (
 	"log"
 
 	"github.com/Vaivaswat2244/go-torrent/internal/engine"
+	"github.com/Vaivaswat2244/go-torrent/internal/mse"
 )
 
 // defaultPort is the TCP port we listen on and advertise to trackers.
@@ -35,7 +36,15 @@ func main() {
 	maxPeers := flag.Int("max-peers", engine.DefaultMaxPeers, "Maximum simultaneous peer connections")
 	seedRatio := flag.Float64("seed-ratio", 0, "Stop seeding at this upload/download ratio (0 = unlimited)")
 	seedTime := flag.Duration("seed-time", 0, "Stop seeding after this long, e.g. 2h (0 = unlimited)")
+	encryption := flag.String("encryption", "prefer",
+		"Peer connection encryption: prefer, require, or off. Encryption hides BitTorrent\n"+
+			"from networks that block it; prefer falls back to plain for peers without it")
 	flag.Parse()
+
+	policy, err := mse.ParsePolicy(*encryption)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	if *port > 65535 {
 		log.Fatalf("invalid port %d", *port)
@@ -46,9 +55,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	runTUI(peerID, *outputDir, uint16(*port), engine.Limits{
-		MaxPeers:  *maxPeers,
-		SeedRatio: *seedRatio,
-		SeedTime:  *seedTime,
+	runTUI(peerID, *outputDir, uint16(*port), engine.Options{
+		MaxPeers:   *maxPeers,
+		SeedRatio:  *seedRatio,
+		SeedTime:   *seedTime,
+		Encryption: policy,
 	})
 }

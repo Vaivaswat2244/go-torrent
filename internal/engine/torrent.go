@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Vaivaswat2244/go-torrent/internal/dht"
+	"github.com/Vaivaswat2244/go-torrent/internal/mse"
 	"github.com/Vaivaswat2244/go-torrent/internal/p2p"
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
@@ -45,11 +46,18 @@ const (
 	DefaultMaxPeers = 50
 )
 
-// Limits are the optional stop conditions for seeding. Zero means unlimited.
-type Limits struct {
-	MaxPeers  int
+// Options configures a torrent. The zero value is usable: default peer cap,
+// no seeding limits, and encryption preferred.
+type Options struct {
+	MaxPeers int
+
+	// Seeding stops once either limit is reached. Zero means unlimited.
 	SeedRatio float64
 	SeedTime  time.Duration
+
+	// Encryption controls MSE. PolicyPrefer, the zero value, tries an
+	// encrypted connection first and falls back to plain BitTorrent.
+	Encryption mse.Policy
 }
 
 type TorrentStats struct {
@@ -80,7 +88,7 @@ type Torrent struct {
 	bitfield *p2p.SafeBitfield
 	swarm    *swarm
 	maxPeers int
-	limits   Limits
+	opts     Options
 
 	workQueue chan *p2p.PieceWork
 	results   chan *p2p.PieceResult
@@ -117,16 +125,16 @@ type Torrent struct {
 }
 
 func NewTorrent(tf *torrentfile.TorrentFile, outDir string) (*Torrent, error) {
-	return NewTorrentWithLimits(tf, outDir, Limits{})
+	return NewTorrentWithOptions(tf, outDir, Options{})
 }
 
-func NewTorrentWithLimits(tf *torrentfile.TorrentFile, outDir string, limits Limits) (*Torrent, error) {
+func NewTorrentWithOptions(tf *torrentfile.TorrentFile, outDir string, opts Options) (*Torrent, error) {
 	writer, err := p2p.NewMultiFileWriter(outDir, tf)
 	if err != nil {
 		return nil, err
 	}
 
-	maxPeers := limits.MaxPeers
+	maxPeers := opts.MaxPeers
 	if maxPeers <= 0 {
 		maxPeers = DefaultMaxPeers
 	}
@@ -142,7 +150,7 @@ func NewTorrentWithLimits(tf *torrentfile.TorrentFile, outDir string, limits Lim
 		bitfield:     p2p.NewSafeBitfield(totalPieces),
 		swarm:        newSwarm(maxPeers),
 		maxPeers:     maxPeers,
-		limits:       limits,
+		opts:         opts,
 		workQueue:    make(chan *p2p.PieceWork, totalPieces),
 		results:      make(chan *p2p.PieceResult, 100),
 		peerChan:     make(chan torrentfile.Peer, 500),
@@ -395,7 +403,7 @@ func (t *Torrent) seedUntilDone() {
 		return
 	}
 
-	if t.limits.SeedRatio <= 0 && t.limits.SeedTime <= 0 {
+	if t.opts.SeedRatio <= 0 && t.opts.SeedTime <= 0 {
 		<-t.ctx.Done()
 		t.setStatus(StatusStopped)
 		return
@@ -413,16 +421,16 @@ func (t *Torrent) seedUntilDone() {
 		case <-ticker.C:
 			stats := t.GetStats()
 
-			if t.limits.SeedRatio > 0 && stats.Ratio >= t.limits.SeedRatio {
+			if t.opts.SeedRatio > 0 && stats.Ratio >= t.opts.SeedRatio {
 				t.logf("Seed ratio %.2f reached, stopping", stats.Ratio)
 				t.stopSeeding()
 				return
 			}
 
-			if t.limits.SeedTime > 0 {
+			if t.opts.SeedTime > 0 {
 				since := time.Since(time.Unix(0, t.completedAt.Load()))
-				if since >= t.limits.SeedTime {
-					t.logf("Seeded for %s, stopping", t.limits.SeedTime)
+				if since >= t.opts.SeedTime {
+					t.logf("Seeded for %s, stopping", t.opts.SeedTime)
 					t.stopSeeding()
 					return
 				}
@@ -631,7 +639,7 @@ func (t *Torrent) managePeers(peerID [20]byte) {
 func (t *Torrent) dialPeer(peer torrentfile.Peer, peerID [20]byte) {
 	session, err := p2p.Dial(
 		t.ctx, peer, t.TF, peerID, t.bitfield, t.Writer,
-		t.workQueue, t.results, t.logf,
+		t.workQueue, t.results, t.logf, t.opts.Encryption,
 	)
 	if err != nil {
 		return
@@ -676,7 +684,13 @@ func (t *Torrent) collect() {
 			stalled := time.Since(t.lastPieceAt) > stallAfter
 			if stalled && t.status == StatusDownloading {
 				t.status = StatusStalled
-				t.logf("No pieces for %s - still trying", stallAfter)
+				// Queued pieces are waiting for a peer that has them; the
+				// rest are claimed by a session that is not delivering.
+				// Telling the two apart is most of diagnosing a stall.
+				remaining := t.totalPieces - t.piecesDone
+				queued := len(t.workQueue)
+				t.logf("No pieces for %s - %d left: %d queued, %d in flight",
+					stallAfter, remaining, queued, remaining-queued)
 			}
 			t.mu.Unlock()
 
