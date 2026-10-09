@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>go-torrent docs</title>
+<meta name="description" content="Installing, running, and troubleshooting go-torrent: options, seeding, port forwarding, and protocol encryption.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='0' y='0' width='7' height='7' fill='%230b7265'/%3E%3Crect x='9' y='0' width='7' height='7' fill='%230b7265'/%3E%3Crect x='0' y='9' width='7' height='7' fill='%230b7265'/%3E%3Crect x='9' y='9' width='7' height='7' fill='%23c98a1b'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap">
+<style>
+:root {
+  --bg: #f2f4f1;
+  --ink: #1d2721;
+  --muted: #5a6a61;
+  --accent: #0b7265;
+  --amber: #c98a1b;
+  --edge: #c9d2cb;
+  --codebg: #e7ebe6;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121714; --ink: #dde5df; --muted: #93a39a;
+    --accent: #3fae9b; --amber: #d8a13f; --edge: #2c3630; --codebg: #1a211d;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121714; --ink: #dde5df; --muted: #93a39a;
+  --accent: #3fae9b; --amber: #d8a13f; --edge: #2c3630; --codebg: #1a211d;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  line-height: 1.65;
+  padding-inline: 16px;
+}
+.col { max-width: 44rem; margin-inline: auto; padding-bottom: 3rem; }
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+header.site {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 1rem;
+  padding-block: 1.4rem 0.9rem;
+  font-family: var(--mono); font-size: 0.95rem;
+}
+header.site .name { font-weight: 600; color: var(--ink); text-decoration: none; }
+header.site nav { display: flex; gap: 1.4rem; }
+header.site nav a { color: var(--muted); text-decoration: none; }
+header.site nav a:hover { color: var(--accent); }
+
+.bitfield { display: flex; gap: 3px; height: 7px; }
+.bitfield span { flex: 1; background: var(--accent); opacity: .85; }
+.bitfield span.pend { background: var(--amber); }
+.bitfield span.empty { background: var(--edge); }
+
+h1 {
+  font-family: var(--mono); font-weight: 600;
+  font-size: 1.7rem; letter-spacing: -0.01em;
+  margin: 2.2rem 0 0.4rem;
+}
+.toc {
+  font-family: var(--mono); font-size: 0.85rem;
+  margin: 1.2rem 0 2.5rem;
+  padding: 0.9rem 1.1rem;
+  border-left: 3px solid var(--accent);
+  background: var(--codebg);
+}
+.toc a { display: inline-block; margin-right: 1.2rem; text-decoration: none; }
+.toc a:hover { text-decoration: underline; }
+
+h2 {
+  font-family: var(--mono); font-size: 1.05rem; font-weight: 600;
+  margin: 2.6rem 0 0.8rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--edge);
+}
+h2::before { content: "## "; color: var(--amber); font-weight: 400; }
+h2 a.anchor { color: inherit; text-decoration: none; }
+
+p, li { max-width: 42em; }
+pre {
+  font-family: var(--mono); font-size: 0.85rem; line-height: 1.6;
+  background: var(--codebg);
+  padding: 0.8rem 1rem;
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+code { font-family: var(--mono); font-size: 0.85em; }
+p code, li code, td code { border: 1px solid var(--edge); padding: 0.05em 0.35em; }
+pre code { border: 0; padding: 0; font-size: inherit; }
+
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; margin: 1rem 0; }
+.tablewrap { overflow-x: auto; }
+th, td { text-align: left; padding: 0.45rem 0.9rem 0.45rem 0; border-bottom: 1px solid var(--edge); vertical-align: top; }
+th { font-family: var(--mono); font-size: 0.8rem; font-weight: 500; color: var(--muted); }
+td:first-child { font-family: var(--mono); font-size: 0.85rem; white-space: nowrap; }
+
+kbd {
+  font-family: var(--mono); font-size: 0.8em;
+  border: 1px solid var(--edge); border-bottom-width: 2px;
+  padding: 0.05em 0.4em; border-radius: 3px;
+}
+
+footer.site {
+  margin-top: 3rem; padding-block: 1.4rem 0;
+  border-top: 1px solid var(--edge);
+  font-family: var(--mono); font-size: 0.8rem; color: var(--muted);
+  display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; justify-content: space-between;
+}
+footer.site a { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="col">
+
+<header class="site">
+  <a class="name" href="../index.html">go-torrent</a>
+  <nav>
+    <a href="./" aria-current="page">docs</a>
+    <a href="https://github.com/Vaivaswat2244/go-torrent">github</a>
+  </nav>
+</header>
+
+<div class="bitfield" aria-hidden="true">
+  <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span class="pend"></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span class="pend"></span><span></span><span></span><span></span><span></span><span class="empty"></span><span></span><span></span><span></span><span class="empty"></span><span class="pend"></span><span></span><span class="empty"></span><span class="empty"></span>
+</div>
+
+<h1>Documentation</h1>
+
+<nav class="toc" aria-label="Contents">
+  <a href="#install">install</a>
+  <a href="#usage">usage</a>
+  <a href="#options">options</a>
+  <a href="#seeding">seeding</a>
+  <a href="#encryption">encryption</a>
+  <a href="#resume">resume</a>
+  <a href="#troubleshooting">troubleshooting</a>
+  <a href="#not-implemented">not implemented</a>
+  <a href="#development">development</a>
+</nav>
+
+<h2 id="install">Install</h2>
+<p>go-torrent builds from source with the Go toolchain (Go 1.21 or later):</p>
+<pre><code>go install github.com/Vaivaswat2244/go-torrent/cmd/client@latest</code></pre>
+<p>That installs a binary named <code>client</code> into your <code>GOBIN</code>.
+To build it under its own name, clone the repository and run:</p>
+<pre><code>go build -o go-torrent ./cmd/client</code></pre>
+
+<h2 id="usage">Usage</h2>
+<pre><code>go-torrent [-output &lt;dir&gt;]</code></pre>
+<p>The client opens a menu where you choose a <code>.torrent</code> file or
+paste a magnet link. For magnet links, metadata is fetched from peers first,
+which can take up to a minute.</p>
+<p>Keys: <kbd>↑</kbd>/<kbd>↓</kbd> and <kbd>enter</kbd> to navigate,
+<kbd>esc</kbd> to go back or cancel a metadata fetch, <kbd>q</kbd> or
+<kbd>ctrl+c</kbd> to quit.</p>
+<p>When a download finishes the client keeps running and seeds until you quit
+or a ratio or time limit is reached.</p>
+
+<h2 id="options">Options</h2>
+<div class="tablewrap">
+<table>
+  <tr><th>flag</th><th>what it does</th></tr>
+  <tr><td>-output</td><td>Output directory. Default: the current directory.</td></tr>
+  <tr><td>-port</td><td>TCP port to listen on for incoming peers. Default: 6881.</td></tr>
+  <tr><td>-max-peers</td><td>Maximum simultaneous peer connections. Default: 50.</td></tr>
+  <tr><td>-seed-ratio</td><td>Stop seeding at this upload/download ratio. 0 means unlimited.</td></tr>
+  <tr><td>-seed-time</td><td>Stop seeding after this long, e.g. <code>2h</code>. 0 means unlimited.</td></tr>
+  <tr><td>-encryption</td><td><code>prefer</code>, <code>require</code>, or <code>off</code>. Default: <code>prefer</code>.</td></tr>
+</table>
+</div>
+
+<h2 id="seeding">Seeding and reachability</h2>
+<p>Peer connections are bidirectional, so the client uploads both to peers
+that connect to it and to peers it connects to. Unchoking follows the
+standard choke algorithm: four unchoke slots recomputed every 10 seconds,
+ranked by reciprocation while downloading and by upload rate while seeding,
+plus an optimistic unchoke every 30 seconds.</p>
+<p>There is no UPnP or NAT-PMP, so if you are behind NAT, peers cannot open
+connections to you unless you forward the port yourself:</p>
+<pre><code>go-torrent -port 6881</code></pre>
+<p>Forward TCP port 6881 (or whichever port you chose) on your router to the
+machine running go-torrent. Without a forwarded port you will still upload on
+connections you initiate, just to fewer peers.</p>
+
+<h2 id="encryption">Encryption</h2>
+<p>Some networks, campuses and workplaces especially, reset any connection
+that looks like BitTorrent. They spot it from the first bytes of a plain
+connection, which are always the same.</p>
+<p>go-torrent supports Message Stream Encryption (MSE, also called protocol
+encryption), the obfuscated handshake mainstream clients use. It is on by
+default: connections are encrypted where the peer supports it, which nearly
+all do, and fall back to plain BitTorrent otherwise. This covers magnet
+metadata fetches too, which otherwise fail on filtering networks before a
+download can start.</p>
+<pre><code>go-torrent -encryption prefer    # default: encrypt, fall back if needed
+go-torrent -encryption require   # never use a plain connection
+go-torrent -encryption off       # plain BitTorrent only</code></pre>
+<p>If downloads work elsewhere but not on a particular network, try
+<code>require</code>.</p>
+<p>MSE hides BitTorrent from filters; it is <em>not</em> privacy. The key
+exchange is unauthenticated, and your IP address is visible to every peer
+and tracker as usual. Note also that MSE only applies to peer connections:
+the DHT and UDP trackers are not covered. A network that blocks those will
+still limit peer discovery; trackers over HTTPS are unaffected.</p>
+
+<h2 id="resume">Resume</h2>
+<p>If the output directory already contains data for the torrent, it is
+re-hashed on start and valid pieces are skipped, so an interrupted download
+continues where it left off. Verification runs off the UI thread, so the
+interface stays responsive while existing data is checked.</p>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+<p><strong>The download shows a stall message.</strong> The message says why:
+no peers, nobody has the remaining pieces, or how many remaining pieces are
+queued and how many are held by peers. A stall with connected peers usually
+resolves itself; pieces held by an unresponsive peer are reassigned after 30
+seconds without data.</p>
+<p><strong>Downloads work at home but not on this network.</strong> The
+network is probably filtering BitTorrent. Run with
+<code>-encryption require</code>. If the torrent relies on UDP trackers or
+DHT for peers, discovery may still be limited, since MSE covers only peer
+connections; magnet links and torrents with HTTPS trackers fare best.</p>
+<p>To check whether a network is blocking BitTorrent, compare plain and
+encrypted handshakes against real peers:</p>
+<pre><code>GOTORRENT_LIVE=1 go test ./internal/engine/ -run TestLiveHandshakes -v</code></pre>
+<p>If plain handshakes succeed for nobody but encrypted ones do, the network
+is filtering BitTorrent and <code>require</code> is the setting to use.</p>
+<p><strong>Few or no peers upload to me.</strong> If you are behind NAT
+without a forwarded port, peers cannot connect to you; see
+<a href="#seeding">seeding and reachability</a>.</p>
+
+<h2 id="not-implemented">Not implemented</h2>
+<p>UPnP/NAT-PMP port mapping, DHT <code>announce_peer</code> (so DHT users
+cannot discover you; trackers can), PEX, rarest-first and endgame piece
+selection, superseeding, the fast extension, rate limiting, multiple
+simultaneous torrents, IPv6, and base32 magnet links.</p>
+
+<h2 id="development">Development</h2>
+<pre><code>go build ./...
+go vet ./...
+go test -race ./...</code></pre>
+<p>The race detector matters here: the piece bitfield is shared between the
+download loop and every peer goroutine. Network tests are skipped unless you
+opt in:</p>
+<pre><code>GOTORRENT_LIVE=1 go test -race ./internal/engine/ -v -timeout 10m</code></pre>
+<p>The seeding tests need no network — they run a seeder and a leecher
+against each other over loopback, under every combination of encryption
+settings.</p>
+<p>Changes per release are in the
+<a href="https://github.com/Vaivaswat2244/go-torrent/blob/main/RELEASE_NOTES.md">release notes</a>.</p>
+
+<footer class="site">
+  <span>MIT licensed</span>
+  <span><a href="https://github.com/Vaivaswat2244/go-torrent">source on GitHub</a></span>
+</footer>
+
+</div>
+</body>
+</html>

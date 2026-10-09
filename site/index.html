@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>go-torrent</title>
+<meta name="description" content="A BitTorrent client written in Go, with a terminal UI. Bencode, trackers, the peer wire protocol, DHT, and MSE encryption, all implemented from scratch.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='0' y='0' width='7' height='7' fill='%230b7265'/%3E%3Crect x='9' y='0' width='7' height='7' fill='%230b7265'/%3E%3Crect x='0' y='9' width='7' height='7' fill='%230b7265'/%3E%3Crect x='9' y='9' width='7' height='7' fill='%23c98a1b'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&display=swap">
+<style>
+/* Layout: one left-aligned column, ~70ch; the dark terminal window is the only loud element. */
+:root {
+  --bg: #f2f4f1;
+  --ink: #1d2721;
+  --muted: #5a6a61;
+  --accent: #0b7265;
+  --amber: #c98a1b;
+  --edge: #c9d2cb;
+  --term-bg: #101613;
+  --term-ink: #cfe0d6;
+  --term-dim: #6d8278;
+  --term-green: #4cc38a;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121714; --ink: #dde5df; --muted: #93a39a;
+    --accent: #3fae9b; --amber: #d8a13f; --edge: #2c3630;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121714; --ink: #dde5df; --muted: #93a39a;
+  --accent: #3fae9b; --amber: #d8a13f; --edge: #2c3630;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: 1.0625rem;
+  line-height: 1.65;
+  padding-inline: 16px;
+}
+.col { max-width: 46rem; margin-inline: auto; }
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+header.site {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 1rem;
+  padding-block: 1.4rem 0.9rem;
+  font-family: var(--mono);
+  font-size: 0.95rem;
+}
+header.site .name { font-weight: 600; color: var(--ink); text-decoration: none; }
+header.site nav { display: flex; gap: 1.4rem; }
+header.site nav a { color: var(--muted); text-decoration: none; }
+header.site nav a:hover { color: var(--accent); }
+
+/* The bitfield strip: pieces of a torrent, most done, a few in flight. */
+.bitfield { display: flex; gap: 3px; height: 7px; }
+.bitfield span { flex: 1; background: var(--accent); opacity: .85; }
+.bitfield span.pend { background: var(--amber); }
+.bitfield span.empty { background: var(--edge); }
+
+.hero { padding-block: 3rem 1.5rem; }
+h1 {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: clamp(1.9rem, 5.5vw, 2.6rem);
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  margin: 0 0 1rem;
+  text-wrap: balance;
+}
+.hero p.lede { font-size: 1.15rem; max-width: 38em; margin: 0 0 1.8rem; }
+
+.install {
+  display: flex; align-items: stretch; gap: 0;
+  font-family: var(--mono); font-size: 0.85rem;
+  border: 1px solid var(--edge);
+  max-width: 100%;
+}
+.install code {
+  padding: 0.7rem 0.9rem;
+  overflow-x: auto; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.install button {
+  font-family: var(--mono); font-size: 0.8rem;
+  border: 0; border-left: 1px solid var(--edge);
+  background: transparent; color: var(--muted);
+  padding-inline: 0.9rem; cursor: pointer;
+}
+.install button:hover { color: var(--accent); }
+
+/* ——— the terminal ——— */
+.term {
+  background: var(--term-bg);
+  color: var(--term-ink);
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  border-radius: 6px;
+  padding: 1rem 1.1rem 1.1rem;
+  margin-block: 2.2rem;
+  box-shadow: 0 18px 40px -18px rgba(10, 25, 18, 0.45);
+  overflow-x: auto;
+}
+.term .inner { min-width: 34rem; }
+.term .tbar { display: flex; gap: 6px; margin-bottom: 0.9rem; }
+.term .tbar i { width: 10px; height: 10px; border-radius: 50%; background: #35433c; }
+.term .title { color: var(--term-green); font-weight: 600; }
+.term .panels { display: flex; gap: 0.8rem; margin-top: 0.6rem; }
+.term .box { border: 1px solid #2c3a33; border-radius: 4px; padding: 0.6rem 0.8rem; }
+.term .box.main { flex: 1; min-width: 0; }
+.term .lbl { color: var(--term-dim); }
+.term .val { color: var(--term-ink); }
+.term .ok { color: var(--term-green); }
+.term .net .big { font-size: 1.05rem; color: var(--term-ink); }
+.term .net .sub { color: var(--term-dim); }
+.term .net div + div { margin-top: 0.1rem; }
+.term .bar { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.55rem; }
+.term .track { flex: 1; height: 9px; background: #243029; border-radius: 2px; overflow: hidden; }
+.term .fill { height: 100%; width: 43.7%; background: var(--term-green); }
+.term .pct { color: var(--term-dim); }
+.term .log { margin-top: 0.8rem; color: var(--term-dim); }
+.term .help { margin-top: 0.8rem; color: #50625a; }
+@media (prefers-reduced-motion: no-preference) {
+  .term .fill { animation: dl 2.4s cubic-bezier(.3,.7,.3,1) both; }
+  @keyframes dl { from { width: 4%; } to { width: 43.7%; } }
+}
+
+section { padding-block: 1.6rem; }
+h2 {
+  font-family: var(--mono);
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  margin: 0 0 0.8rem;
+}
+h2::before { content: "## "; color: var(--amber); font-weight: 400; }
+section p { max-width: 40em; }
+
+ul.features { list-style: none; padding: 0; margin: 0; max-width: 42em; }
+ul.features li { padding-left: 1.3rem; position: relative; margin-bottom: 0.65rem; }
+ul.features li::before {
+  content: ""; position: absolute; left: 0; top: 0.52em;
+  width: 0.55em; height: 0.55em; background: var(--accent);
+}
+ul.features li.no::before { background: var(--edge); }
+ul.features code, p code, td code {
+  font-family: var(--mono); font-size: 0.85em;
+  border: 1px solid var(--edge); padding: 0.05em 0.35em;
+}
+
+.notdone { color: var(--muted); }
+.notdone p { margin-top: 0.4rem; }
+
+.cta { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; margin-top: 1.2rem; }
+.cta a.docs {
+  font-family: var(--mono); font-size: 0.9rem; text-decoration: none;
+  border: 1px solid var(--accent); color: var(--accent);
+  padding: 0.55rem 1.1rem;
+}
+.cta a.docs:hover { background: var(--accent); color: var(--bg); }
+.cta a.gh { font-family: var(--mono); font-size: 0.9rem; }
+
+footer.site {
+  margin-top: 2.5rem; padding-block: 1.4rem 2rem;
+  border-top: 1px solid var(--edge);
+  font-family: var(--mono); font-size: 0.8rem; color: var(--muted);
+  display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; justify-content: space-between;
+}
+footer.site a { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="col">
+
+<header class="site">
+  <a class="name" href="./">go-torrent</a>
+  <nav>
+    <a href="docs/index.html">docs</a>
+    <a href="https://github.com/Vaivaswat2244/go-torrent">github</a>
+  </nav>
+</header>
+
+<div class="bitfield" aria-hidden="true">
+  <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span class="pend"></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span class="pend"></span><span></span><span></span><span></span><span></span><span class="empty"></span><span></span><span></span><span></span><span class="empty"></span><span class="pend"></span><span></span><span class="empty"></span><span class="empty"></span>
+</div>
+
+<div class="hero">
+  <h1>A BitTorrent client,<br>from the wire up.</h1>
+  <p class="lede">go-torrent is a BitTorrent client written in Go, with a terminal UI.
+  Everything below the interface is implemented from scratch: bencode,
+  .torrent parsing, HTTP and UDP trackers, the peer wire protocol, DHT peer
+  discovery, and MSE protocol encryption.</p>
+  <div class="install">
+    <code id="install-cmd">go install github.com/Vaivaswat2244/go-torrent/cmd/client@latest</code>
+    <button type="button" id="copy-btn" aria-label="Copy install command">copy</button>
+  </div>
+</div>
+
+<div class="term" role="img" aria-label="The go-torrent terminal UI during a download: status, transfer rates, ETA, connected peers, and a live event log.">
+  <div class="inner">
+    <div class="tbar"><i></i><i></i><i></i></div>
+    <div class="title">⚡ go-torrent</div>
+    <div class="panels">
+      <div class="box main">
+        <div><span class="lbl">Status:&nbsp;&nbsp;</span><span class="ok">downloading</span></div>
+        <div><span class="lbl">Size:&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="val">2.10 GB / 4.80 GB</span></div>
+        <div><span class="lbl">Down:&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="val">6.40 MB/s</span></div>
+        <div><span class="lbl">ETA:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="val">7m 12s</span></div>
+        <div><span class="lbl">Uploaded:</span><span class="val"> 312.00 MB  (ratio 0.15)</span></div>
+        <div class="bar">
+          <div class="track"><div class="fill"></div></div>
+          <span class="pct">43.75%</span>
+        </div>
+      </div>
+      <div class="box net">
+        <div class="lbl">🌐 Network</div>
+        <div class="big">31</div>
+        <div class="sub">connected peers</div>
+        <div class="big">4</div>
+        <div class="sub">being served</div>
+      </div>
+    </div>
+    <div class="box log">
+      <div>· piece 1398/3196 complete</div>
+      <div>· tracker announce ok: 48 peers</div>
+      <div>· encrypted handshake with 203.0.113.9:51413</div>
+    </div>
+    <div class="help">↑/↓ · enter to select · esc to go back · q to quit</div>
+  </div>
+</div>
+
+<section>
+  <h2>what it does</h2>
+  <ul class="features">
+    <li><code>.torrent</code> files, single- and multi-file, and magnet links with metadata fetched from peers</li>
+    <li>HTTP/HTTPS and UDP trackers, with periodic re-announce, plus DHT peer discovery</li>
+    <li>Uploading and seeding, with the standard choke algorithm: four unchoke slots recomputed every 10s and an optimistic unchoke every 30s</li>
+    <li>Resume: existing data is re-hashed on start, and valid pieces are skipped</li>
+    <li>Terminal UI with progress, transfer rates, ETA, ratio, and a live event log</li>
+  </ul>
+</section>
+
+<section>
+  <h2>works on networks that block BitTorrent</h2>
+  <p>Some networks, campuses and workplaces especially, reset any connection
+  that looks like BitTorrent. go-torrent supports Message Stream Encryption,
+  the obfuscated handshake mainstream clients use, and it is on by default:
+  connections are encrypted where the peer supports it and fall back to plain
+  BitTorrent otherwise. If downloads work elsewhere but not on one network,
+  run with <code>-encryption require</code>.</p>
+  <p>MSE hides BitTorrent from filters; it is not privacy. Your IP address is
+  visible to every peer and tracker as usual.</p>
+</section>
+
+<section class="notdone">
+  <h2>what it doesn't do</h2>
+  <p>No UPnP or NAT-PMP, so behind a router you forward the port yourself.
+  No PEX, no rarest-first or endgame piece selection, no rate limiting, one
+  torrent at a time, no IPv6. The <a href="docs/index.html#not-implemented">full
+  list</a> is in the docs; what is implemented is tested, including a seeder
+  and leecher run against each other over loopback under every encryption
+  setting.</p>
+</section>
+
+<section>
+  <h2>get started</h2>
+  <p>Install with the Go toolchain, point it at a torrent file or magnet
+  link, and it downloads, then stays up and seeds until you quit or hit a
+  ratio or time limit.</p>
+  <div class="cta">
+    <a class="docs" href="docs/index.html">Read the docs</a>
+    <a class="gh" href="https://github.com/Vaivaswat2244/go-torrent">source on GitHub</a>
+  </div>
+</section>
+
+<footer class="site">
+  <span>MIT licensed</span>
+  <span><a href="https://github.com/Vaivaswat2244/go-torrent/blob/main/RELEASE_NOTES.md">release notes</a></span>
+</footer>
+
+</div>
+<script>
+document.getElementById('copy-btn').addEventListener('click', function () {
+  var btn = this;
+  var text = document.getElementById('install-cmd').textContent;
+  function done() { btn.textContent = 'copied'; setTimeout(function () { btn.textContent = 'copy'; }, 1500); }
+  function fallback() {
+    var r = document.createRange();
+    r.selectNodeContents(document.getElementById('install-cmd'));
+    var s = getSelection(); s.removeAllRanges(); s.addRange(r);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else { fallback(); }
+});
+</script>
+</body>
+</html>
