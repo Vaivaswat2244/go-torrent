@@ -44,7 +44,7 @@ func isQuit(t *testing.T, cmd tea.Cmd) bool {
 func TestQuitKeysOnDownloadScreen(t *testing.T) {
 	for _, key := range []string{"q", "esc", "ctrl+c"} {
 		t.Run(key, func(t *testing.T) {
-			m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Limits{})
+			m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Options{})
 			m.screen = screenDownload
 
 			_, cmd := m.Update(keyMsg(key))
@@ -56,7 +56,7 @@ func TestQuitKeysOnDownloadScreen(t *testing.T) {
 }
 
 func TestMenuNavigation(t *testing.T) {
-	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Limits{})
+	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Options{})
 
 	next, _ := m.Update(keyMsg("down"))
 	m = next.(model)
@@ -212,7 +212,7 @@ func TestLongMagnetLinkIsNotTruncated(t *testing.T) {
 		t.Fatalf("test magnet is only %d chars; it must exceed the old 512 limit to be meaningful", len(uri))
 	}
 
-	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Limits{})
+	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Options{})
 
 	// Menu -> Magnet link -> input screen.
 	next, _ := m.Update(keyMsg("down"))
@@ -254,7 +254,7 @@ func TestLongPathIsNotTruncated(t *testing.T) {
 		t.Fatalf("test path is only %d chars", len(path))
 	}
 
-	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Limits{})
+	m := initialModel([20]byte{}, t.TempDir(), 6881, engine.Options{})
 
 	next, _ := m.Update(keyMsg("enter")) // torrent-file mode
 	m = next.(model)

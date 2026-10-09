@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Vaivaswat2244/go-torrent/internal/bencode"
+	"github.com/Vaivaswat2244/go-torrent/internal/mse"
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
 
@@ -109,12 +113,72 @@ func drainEvents(t *testing.T, tor *Torrent, label string) {
 	}()
 }
 
-// TestSeedToLeech is the end-to-end proof that uploading works: one instance
-// holds the complete data and serves it, another starts empty and fetches the
-// whole torrent from it over loopback. It exercises the listener, the inbound
-// handshake, the choker, request validation, block reads and piece assembly,
-// with no tracker, no DHT and no internet.
-func TestSeedToLeech(t *testing.T) {
+// wireTap is a TCP proxy that records everything passing through it in both
+// directions, so tests can inspect what a peer connection looks like on the wire.
+type wireTap struct {
+	ln  net.Listener
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func newWireTap(t *testing.T, target string) *wireTap {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tap := &wireTap{ln: ln}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			in, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			out, err := net.Dial("tcp", target)
+			if err != nil {
+				in.Close()
+				continue
+			}
+			pipe := func(dst, src net.Conn) {
+				io.Copy(dst, io.TeeReader(src, tap))
+				dst.Close()
+				src.Close()
+			}
+			go pipe(out, in)
+			go pipe(in, out)
+		}
+	}()
+	return tap
+}
+
+func (w *wireTap) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func (w *wireTap) captured() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]byte(nil), w.buf.Bytes()...)
+}
+
+func (w *wireTap) port() int { return w.ln.Addr().(*net.TCPAddr).Port }
+
+type transferResult struct {
+	completed bool
+	wire      []byte
+}
+
+// runTransfer starts a seeder holding the complete torrent and an empty
+// leecher pointed at it through a wire tap, then reports whether the leecher
+// finished and what crossed the wire.
+func runTransfer(t *testing.T, seedOpts, leechOpts Options, wait time.Duration) transferResult {
+	t.Helper()
+
 	// Several pieces, and files sized so pieces straddle boundaries.
 	tf, data := buildTorrent(t, 16384, 40000, 60000, 31072)
 
@@ -123,7 +187,7 @@ func TestSeedToLeech(t *testing.T) {
 	writePayload(t, seedDir, tf, data)
 
 	// --- seeder: already complete, so it goes straight to seeding ---
-	seeder, err := NewTorrent(tf, seedDir)
+	seeder, err := NewTorrentWithOptions(tf, seedDir, seedOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,14 +207,15 @@ func TestSeedToLeech(t *testing.T) {
 		t.Fatal("seeder never started listening")
 	}
 
-	// Wait for it to finish verifying and enter the seeding state.
 	if !waitForStatus(seeder, StatusSeeding, 15*time.Second) {
 		t.Fatalf("seeder did not reach seeding, got %s (%.1f%%)",
 			seeder.GetStats().Status, seeder.GetStats().Progress)
 	}
 
-	// --- leecher: empty directory, no trackers, pointed straight at the seeder ---
-	leecher, err := NewTorrent(tf, leechDir)
+	tap := newWireTap(t, fmt.Sprintf("127.0.0.1:%d", addr.(*net.TCPAddr).Port))
+
+	// --- leecher: empty directory, no trackers, pointed at the seeder via the tap ---
+	leecher, err := NewTorrentWithOptions(tf, leechDir, leechOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,21 +224,13 @@ func TestSeedToLeech(t *testing.T) {
 
 	leecher.Start(peerID(t, 'L'), 0)
 
-	tcpAddr := addr.(*net.TCPAddr)
 	// Give the leecher a moment to finish verifying before injecting the peer,
 	// since AddPeer is non-blocking.
 	time.Sleep(300 * time.Millisecond)
-	for i := 0; i < 20; i++ {
-		leecher.AddPeer(torrentfile.Peer{IP: net.IPv4(127, 0, 0, 1), Port: uint16(tcpAddr.Port)})
-		if leecher.GetStats().PeersActive > 0 {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
+	leecher.AddPeer(torrentfile.Peer{IP: net.IPv4(127, 0, 0, 1), Port: uint16(tap.port())})
 
-	if !waitForStatus(leecher, StatusSeeding, 60*time.Second) {
-		s := leecher.GetStats()
-		t.Fatalf("leecher did not complete: %.2f%% (%s), peers=%d", s.Progress, s.Status, s.PeersActive)
+	if !waitForStatus(leecher, StatusSeeding, wait) {
+		return transferResult{completed: false, wire: tap.captured()}
 	}
 
 	// The transfer must have actually gone through the seeder.
@@ -196,6 +253,72 @@ func TestSeedToLeech(t *testing.T) {
 			t.Errorf("%s: content does not match the original", filepath.Join(f.Path...))
 		}
 		offset += f.Length
+	}
+
+	return transferResult{completed: true, wire: tap.captured()}
+}
+
+var btSignature = []byte("BitTorrent protocol")
+
+// TestSeedToLeech is the end-to-end proof that uploading works: one instance
+// holds the complete data and serves it, another starts empty and fetches the
+// whole torrent from it over loopback. It exercises the listener, both
+// handshakes, the choker, request validation, block reads and piece assembly,
+// with no tracker, no DHT and no internet — under each encryption pairing.
+func TestSeedToLeech(t *testing.T) {
+	prefer := Options{Encryption: mse.PolicyPrefer}
+	require := Options{Encryption: mse.PolicyRequire}
+	off := Options{Encryption: mse.PolicyDisable}
+
+	// Note the field order: seeder first, then leecher.
+	cases := []struct {
+		name          string
+		seeder        Options
+		leecher       Options
+		wantComplete  bool
+		wantEncrypted bool
+	}{
+		// The default: both sides try MSE, so the whole transfer is encrypted.
+		{"both prefer", prefer, prefer, true, true},
+		{"both require", require, require, true, true},
+
+		// A seeder that refuses MSE forces the leecher's fallback to plain.
+		{"leecher prefers, seeder has it off", off, prefer, true, false},
+		// A leecher with encryption off dials in the clear; a preferring
+		// seeder must still accept it.
+		{"leecher off, seeder prefers", prefer, off, true, false},
+
+		// No overlap: nothing may transfer.
+		{"leecher requires, seeder has it off", off, require, false, false},
+		{"leecher off, seeder requires", require, off, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wait := 60 * time.Second
+			if !tc.wantComplete {
+				wait = 5 * time.Second
+			}
+
+			res := runTransfer(t, tc.seeder, tc.leecher, wait)
+
+			if res.completed != tc.wantComplete {
+				t.Fatalf("completed = %v, want %v", res.completed, tc.wantComplete)
+			}
+			if !tc.wantComplete {
+				return
+			}
+
+			hasSignature := bytes.Contains(res.wire, btSignature)
+			if tc.wantEncrypted && hasSignature {
+				t.Error("the BitTorrent signature crossed the wire on an encrypted transfer")
+			}
+			// The converse checks the tap really is seeing the traffic, so the
+			// assertion above cannot pass vacuously.
+			if !tc.wantEncrypted && !hasSignature {
+				t.Error("expected a plain handshake on the wire, but none was captured")
+			}
+		})
 	}
 }
 
@@ -273,7 +396,7 @@ func TestSeedTimeLimit(t *testing.T) {
 	dir := t.TempDir()
 	writePayload(t, dir, tf, data)
 
-	tor, err := NewTorrentWithLimits(tf, dir, Limits{SeedTime: 2 * time.Second})
+	tor, err := NewTorrentWithOptions(tf, dir, Options{SeedTime: 2 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

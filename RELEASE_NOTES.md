@@ -2,6 +2,38 @@
 
 Notable changes per release. For install and usage, see the [README](README.md).
 
+## Unreleased
+
+### Added
+
+- **Protocol encryption (MSE).** Peer connections are now encrypted by
+  default, so networks that reset BitTorrent traffic by recognising its
+  handshake can no longer do so. Nearly every client supports it; for those
+  that don't, the client falls back to a plain connection. Choose with
+  `-encryption prefer|require|off`. This covers magnet metadata fetches too,
+  which otherwise failed on filtering networks before a download could start.
+
+  Verified against an independent implementation in both directions, and
+  against real swarms, where peers accepted encrypted handshakes at the same
+  rate as plain ones.
+
+### Fixed
+
+- Downloads could stall permanently just short of 100%. Several separate
+  causes, all in the peer session code added in v0.2.0:
+  - A peer that disconnected mid-piece took the piece with it, so it was never
+    downloaded.
+  - A peer that choked us kept its piece claimed, blocking everyone else.
+  - Returning a piece could silently drop it when the connection was closing.
+  - Idle connections only looked for work when a message arrived, so a piece
+    handed back later could sit unclaimed indefinitely.
+  - A peer that unchoked us and then stopped sending held its piece forever.
+    Pieces are now reassigned after 30 seconds without data.
+- A late block for a piece we had already given up no longer drops an
+  otherwise healthy connection.
+- The stall message now says how many remaining pieces are queued and how many
+  are held by peers, which is most of what diagnosing a stall needs.
+
 ## v0.2.0 — 2026-08-24
 
 Seeding support, plus a round of security and reliability fixes.

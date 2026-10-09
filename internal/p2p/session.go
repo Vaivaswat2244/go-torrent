@@ -2,11 +2,12 @@ package p2p
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
-	"net"
 	"sync/atomic"
 	"time"
 
+	"github.com/Vaivaswat2244/go-torrent/internal/mse"
 	"github.com/Vaivaswat2244/go-torrent/internal/peers"
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
@@ -24,10 +25,30 @@ const (
 	// wedge us indefinitely.
 	writeTimeout = 30 * time.Second
 
+	// pickInterval is how often a session re-checks for work and for a stalled
+	// piece. Without it, a session that found the queue empty went idle for
+	// good: a piece handed back later was never noticed, because nothing on
+	// the connection prompted a second look.
+	pickInterval = time.Second
+
 	// outboundQueue is how many messages may be waiting to be written before
 	// the session loop blocks. Blocking is intentional: it becomes TCP
 	// backpressure rather than unbounded memory growth.
 	outboundQueue = 64
+)
+
+// These are variables rather than constants only so tests can shorten them.
+var (
+	// snubTimeout is how long we wait for a block on outstanding requests
+	// before deciding the peer has stopped sending ("snubbed" us) and handing
+	// the piece to someone else. Without it, a peer that unchoked us and then
+	// went quiet held its piece indefinitely.
+	snubTimeout = 30 * time.Second
+
+	// snubCooldown keeps a snubbing peer from immediately reclaiming the piece
+	// it just failed to deliver. The connection stays up, so we can still
+	// upload to it.
+	snubCooldown = time.Minute
 )
 
 // BlockStore is the piece data a session serves from. *MultiFileWriter
@@ -93,6 +114,11 @@ type Session struct {
 	downloaded int
 	requested  int
 	backlog    int
+
+	// lastBlockAt is when the in-flight piece last made progress, and
+	// noPickUntil holds off claiming work after this peer snubbed us.
+	lastBlockAt time.Time
+	noPickUntil time.Time
 
 	// Read concurrently by the choker.
 	uploaded       atomic.Int64
@@ -188,6 +214,10 @@ func (s *Session) Run() {
 	defer s.cancel()
 	defer s.client.Conn.Close()
 
+	// A session that ends mid-piece must give the piece back, or nobody else
+	// can ever fetch it and the download stalls just short of 100%.
+	defer s.releasePiece()
+
 	// Cancellation unblocks any in-flight read or write.
 	stop := context.AfterFunc(s.ctx, func() { s.client.Conn.Close() })
 	defer stop()
@@ -206,6 +236,9 @@ func (s *Session) Run() {
 
 	keepAlive := time.NewTicker(keepAliveInterval)
 	defer keepAlive.Stop()
+
+	pick := time.NewTicker(pickInterval)
+	defer pick.Stop()
 
 	for {
 		select {
@@ -230,6 +263,9 @@ func (s *Session) Run() {
 		case <-keepAlive.C:
 			// A nil message serializes to the 4-byte keep-alive.
 			s.enqueue(nil)
+
+		case now := <-pick.C:
+			s.checkProgress(now)
 		}
 	}
 }
@@ -302,9 +338,11 @@ func (s *Session) handle(msg *peers.Message) error {
 	switch msg.ID {
 	case peers.MsgChoke:
 		s.client.PeerChoking = true
-		// Outstanding requests are discarded by the peer when it chokes us.
-		s.requested = s.downloaded
-		s.backlog = 0
+		// The peer discards our outstanding requests when it chokes us, and
+		// may not unchoke us again for a long time. Holding on to the piece
+		// would stop every other peer from fetching it, so give it back.
+		// Blocks already received for it are discarded.
+		s.releasePiece()
 
 	case peers.MsgUnchoke:
 		s.client.PeerChoking = false
@@ -404,6 +442,14 @@ func (s *Session) receiveBlock(msg *peers.Message) error {
 		return nil // unsolicited or late block
 	}
 
+	// After a choke we give our piece back, but blocks the peer had already
+	// sent can still arrive, possibly once we have moved on to another piece.
+	// ParsePiece rejects a mismatched index as an error, which would drop a
+	// healthy connection over stale data, so filter those out first.
+	if len(msg.Payload) >= 4 && int(binary.BigEndian.Uint32(msg.Payload[0:4])) != s.current.Index {
+		return nil
+	}
+
 	n, err := peers.ParsePiece(s.current.Index, s.buf, msg)
 	if err != nil {
 		return err
@@ -411,6 +457,7 @@ func (s *Session) receiveBlock(msg *peers.Message) error {
 
 	s.downloaded += n
 	s.downloadedTot.Add(int64(n))
+	s.lastBlockAt = time.Now()
 	if s.backlog > 0 {
 		s.backlog--
 	}
@@ -469,6 +516,10 @@ func (s *Session) fillPipeline() {
 // spinning the queue, which the previous implementation did at roughly a
 // thousand rotations a second.
 func (s *Session) pickPiece() bool {
+	if time.Now().Before(s.noPickUntil) {
+		return false
+	}
+
 	for attempts := len(s.workQueue) + 1; attempts > 0; attempts-- {
 		var work *PieceWork
 		select {
@@ -489,19 +540,51 @@ func (s *Session) pickPiece() bool {
 		s.current = work
 		s.buf = make([]byte, work.Length)
 		s.downloaded, s.requested, s.backlog = 0, 0, 0
+		s.lastBlockAt = time.Now()
 		return true
 	}
 
 	return false
 }
 
-// requeue returns a piece for another peer to take. The queue is sized to hold
-// every piece and we are holding one out, so there is always room.
+// requeue returns a piece for another peer to take.
+//
+// The queue is sized to hold every piece, and a piece is only ever in one
+// place, so while we hold one out there is always room and this cannot block.
+// It used to select on the session context as well; when a session was ending
+// both cases were ready, Go picked one at random, and the piece was lost about
+// half the time.
 func (s *Session) requeue(work *PieceWork) {
 	select {
 	case s.workQueue <- work:
-	case <-s.ctx.Done():
+	default:
+		s.logf("peer %s: work queue full, piece %d dropped", s.Addr(), work.Index)
 	}
+}
+
+// checkProgress runs on a timer. An idle session looks for work again, and a
+// session whose peer has stopped delivering gives its piece away.
+func (s *Session) checkProgress(now time.Time) {
+	if s.current == nil {
+		s.fillPipeline()
+		return
+	}
+
+	if s.backlog > 0 && now.Sub(s.lastBlockAt) > snubTimeout {
+		s.logf("peer %s: no data for %s, handing piece %d to another peer",
+			s.Addr(), snubTimeout, s.current.Index)
+		s.releasePiece()
+		s.noPickUntil = now.Add(snubCooldown)
+	}
+}
+
+// releasePiece hands the in-flight piece back and clears download progress.
+func (s *Session) releasePiece() {
+	if s.current != nil {
+		s.requeue(s.current)
+	}
+	s.current, s.buf = nil, nil
+	s.downloaded, s.requested, s.backlog = 0, 0, 0
 }
 
 // Dial opens an outgoing connection, handshakes, and returns a ready session.
@@ -515,16 +598,10 @@ func Dial(
 	workQueue chan *PieceWork,
 	results chan *PieceResult,
 	logf LogFunc,
+	encryption mse.Policy,
 ) (*Session, error) {
-	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", peer.String())
+	client, err := peers.Connect(ctx, peer.String(), tf.InfoHash, peerID, encryption)
 	if err != nil {
-		return nil, err
-	}
-
-	client, err := peers.CompleteHandshake(conn, tf.InfoHash, peerID)
-	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 

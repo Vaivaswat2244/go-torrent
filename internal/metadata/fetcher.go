@@ -4,10 +4,10 @@ import (
 	"context"
 	"crypto/sha1"
 	"fmt"
-	"net"
 	"time"
 
 	"github.com/Vaivaswat2244/go-torrent/internal/bencode"
+	"github.com/Vaivaswat2244/go-torrent/internal/mse"
 	"github.com/Vaivaswat2244/go-torrent/internal/peers"
 	"github.com/Vaivaswat2244/go-torrent/internal/torrentfile"
 )
@@ -18,7 +18,10 @@ import (
 const maxMetadataSize = 16 << 20 // 16 MiB
 
 // Fetch coordinates the downloading of the .torrent metadata from peers
-func Fetch(ctx context.Context, infoHash [20]byte, peerID [20]byte, peerChan <-chan torrentfile.Peer) ([]byte, error) {
+//
+// encryption applies here too: on a network that resets plain BitTorrent
+// connections, a plaintext metadata fetch fails before the download can start.
+func Fetch(ctx context.Context, infoHash [20]byte, peerID [20]byte, peerChan <-chan torrentfile.Peer, encryption mse.Policy) ([]byte, error) {
 	// Buffered so a verified result is never dropped. Previously this was
 	// unbuffered with a "default:" send, so if the receiver was not parked at
 	// that exact instant the metadata was thrown away and the worker exited.
@@ -42,7 +45,7 @@ func Fetch(ctx context.Context, infoHash [20]byte, peerID [20]byte, peerChan <-c
 						return
 					}
 
-					infoBytes, err := tryFetchFromPeer(peer, infoHash, peerID)
+					infoBytes, err := tryFetchFromPeer(ctx, peer, infoHash, peerID, encryption)
 					if err != nil {
 						continue
 					}
@@ -73,18 +76,13 @@ func Fetch(ctx context.Context, infoHash [20]byte, peerID [20]byte, peerChan <-c
 	}
 }
 
-func tryFetchFromPeer(peer torrentfile.Peer, infoHash, peerID [20]byte) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", peer.String(), 3*time.Second)
+func tryFetchFromPeer(ctx context.Context, peer torrentfile.Peer, infoHash, peerID [20]byte, encryption mse.Policy) ([]byte, error) {
+	// 1. Handshake, encrypted according to policy
+	client, err := peers.Connect(ctx, peer.String(), infoHash, peerID, encryption)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-
-	// 1. Standard Handshake
-	client, err := peers.CompleteHandshake(conn, infoHash, peerID)
-	if err != nil {
-		return nil, err
-	}
+	defer client.Conn.Close()
 
 	// 2. Send Extended Handshake (BEP 10)
 	extHandshake := map[string]interface{}{
